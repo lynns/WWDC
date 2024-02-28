@@ -7,18 +7,14 @@
 //
 
 import Cocoa
-import RxCocoa
-import RxSwift
 import ConfCore
 
-enum PreferencesTab: Int {
+enum PreferencesTab: Int, WWDCTab {
     case general
     case playback
 }
 
 final class PreferencesCoordinator {
-
-    private let disposeBag = DisposeBag()
 
     private let windowController: PreferencesWindowController
 

@@ -9,11 +9,10 @@
 import Cocoa
 import PlayerUI
 
-enum MainWindowTab: Int {
-    case featured
+enum MainWindowTab: Int, WWDCTab {
+    case explore
     case schedule
     case videos
-    case community
 
     func stringValue() -> String {
         var name = ""
@@ -22,6 +21,8 @@ enum MainWindowTab: Int {
 
         return name
     }
+
+    var hidesWindowTitleBar: Bool { self == .explore }
 }
 
 extension Notification.Name {

@@ -8,7 +8,6 @@
 
 import Cocoa
 import RealmSwift
-import RxSwift
 import ConfCore
 import PlayerUI
 
@@ -65,6 +64,12 @@ extension AppCoordinator: SessionsTableViewControllerDelegate {
 
             guard DownloadManager.shared.isDownloading(viewModel.session) else { return }
 
+            DownloadManager.shared.deleteDownloadedFile(for: viewModel.session)
+        }
+    }
+
+    func sessionTableViewContextMenuActionRemoveDownload(viewModels: [SessionViewModel]) {
+        viewModels.forEach { viewModel in
             DownloadManager.shared.deleteDownloadedFile(for: viewModel.session)
         }
     }

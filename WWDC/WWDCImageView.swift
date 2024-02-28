@@ -8,23 +8,7 @@
 
 import Cocoa
 
-// See:
-//  https://forums.developer.apple.com/thread/79144
-//  https://stackoverflow.com/q/44537356/3927536
-#if swift(>=4.0)
-let NSURLPboardType = NSPasteboard.PasteboardType(kUTTypeURL as String)
-let NSFilenamesPboardType = NSPasteboard.PasteboardType("NSFilenamesPboardType")
-#endif
-
-protocol WWDCImageViewDelegate: AnyObject {
-
-    func wwdcImageView(_ imageView: WWDCImageView, didReceiveNewImageWithFileURL url: URL)
-
-}
-
-class WWDCImageView: NSView {
-
-    weak var delegate: WWDCImageViewDelegate?
+final class WWDCImageView: NSView {
 
     var cornerRadius: CGFloat = 4 {
         didSet {
@@ -48,17 +32,7 @@ class WWDCImageView: NSView {
         }
     }
 
-    @objc var isEditable: Bool = false {
-        didSet {
-            if isEditable {
-                registerForDraggedTypes([NSURLPboardType, NSFilenamesPboardType])
-            } else {
-                unregisterDraggedTypes()
-            }
-        }
-    }
-
-    var image: NSImage? = nil {
+    var image: NSImage? {
         didSet {
             imageLayer.contents = image
         }
@@ -108,27 +82,6 @@ class WWDCImageView: NSView {
 
     override func makeBackingLayer() -> CALayer {
         return WWDCLayer()
-    }
-
-    // MARK: - Editing
-
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        return .copy
-    }
-
-    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        guard let file = (sender.draggingPasteboard.propertyList(forType: NSFilenamesPboardType) as? [String])?.first else { return false }
-
-        let fileURL = URL(fileURLWithPath: file)
-
-        guard let image = NSImage.thumbnailImage(with: fileURL, maxWidth: 400) else {
-            return false
-        }
-
-        self.image = image
-        delegate?.wwdcImageView(self, didReceiveNewImageWithFileURL: fileURL)
-
-        return true
     }
 
     private func updateCorners() {

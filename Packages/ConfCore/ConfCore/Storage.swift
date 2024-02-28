@@ -6,37 +6,38 @@
 //  Copyright © 2017 Guilherme Rambo. All rights reserved.
 //
 
+import Combine
 import Foundation
 import RealmSwift
-import RxSwift
-import RxRealm
-import RxCocoa
-import os.log
+import OSLog
+import OrderedCollections
 
-public final class Storage {
+public final class Storage: Logging, Signposting {
 
     public let realmConfig: Realm.Configuration
     public let realm: Realm
 
-    let disposeBag = DisposeBag()
-    private static let log = OSLog(subsystem: "ConfCore", category: "Storage")
-    private let log = Storage.log
+    private var disposeBag: Set<AnyCancellable> = []
+    public static let log = makeLogger()
+    public static var signposter = makeSignposter()
 
     public init(_ realm: Realm) {
         self.realmConfig = realm.configuration
         self.realm = realm
 
-        DistributedNotificationCenter.default().rx.notification(.TranscriptIndexingDidStart).subscribe(onNext: { [unowned self] _ in
-            os_log("Locking Realm auto-updates until transcript indexing is finished", log: self.log, type: .info)
-
-            self.realm.autorefresh = false
-        }).disposed(by: disposeBag)
-
-        DistributedNotificationCenter.default().rx.notification(.TranscriptIndexingDidStop).subscribe(onNext: { [unowned self] _ in
-            os_log("Realm auto-updates unlocked", log: self.log, type: .info)
-
-            self.realm.autorefresh = true
-        }).disposed(by: disposeBag)
+        // This used to be necessary because of CPU usage in the app during script indexing, but it causes a long period of time during indexing where content doesn't reflect what's on the database,
+        // including for user actions such as favoriting, etc. Tested with the current version of Realm in the app and it doesn't seem to be an issue anymore.
+//        DistributedNotificationCenter.default().publisher(for: .TranscriptIndexingDidStart).sink(receiveValue: { [unowned self] _ in
+//            os_log("Locking Realm auto-updates until transcript indexing is finished", log: self.log, type: .info)
+//
+//            self.realm.autorefresh = false
+//        }).store(in: &disposeBag)
+//
+//        DistributedNotificationCenter.default().publisher(for: .TranscriptIndexingDidStop).sink(receiveValue: { [unowned self] _ in
+//            os_log("Realm auto-updates unlocked", log: self.log, type: .info)
+//
+//            self.realm.autorefresh = true
+//        }).store(in: &disposeBag)
 
         deleteOldEventsIfNeeded()
     }
@@ -46,7 +47,9 @@ public final class Storage {
         return try Realm(configuration: realmConfig, queue: queue)
     }
 
-    private lazy var dispatchQueue = DispatchQueue(label: "WWDC Storage", qos: .background)
+    /// This is the background dispatch queue for Realm updates to take place not on the main thread.
+    /// While it is not on the main thread, it is very important for the changes to happen quickly so the qos is set to userInitiated
+    private lazy var dispatchQueue = DispatchQueue(label: "WWDC Storage", qos: .userInitiated)
 
     public lazy var storageQueue: OperationQueue = {
         let q = OperationQueue()
@@ -67,10 +70,7 @@ public final class Storage {
                 realm.delete(wwdc2012)
             }
         } catch {
-            os_log("Error deleting old events: %{public}@",
-                   log: log,
-                   type: .error,
-                   String(describing: error))
+            log.error("Error deleting old events: \(String(describing: error), privacy: .public)")
         }
     }
 
@@ -81,19 +81,28 @@ public final class Storage {
     }
 
     func store(contentResult: Result<ContentsResponse, APIError>, completion: @escaping (Error?) -> Void) {
+        let state = signposter.beginInterval("store content result", id: signposter.makeSignpostID(), "begin")
         let contentsResponse: ContentsResponse
         do {
             contentsResponse = try contentResult.get()
         } catch {
-            os_log("Error downloading contents:\n%{public}@",
-                   log: log,
-                   type: .error,
-                   String(describing: error))
+            log.error("Error downloading contents:\n\(String(describing: error), privacy: .public)")
+            signposter.endInterval("store content result", state, "end")
             completion(error)
             return
         }
 
-        performSerializedBackgroundWrite(writeBlock: { backgroundRealm in
+        performSerializedBackgroundWrite(
+            disableAutorefresh: true
+        ) { [weak self] in
+            self?.signposter.endInterval("store content result", state, "end")
+            completion($0)
+        } writeBlock: { backgroundRealm in
+            // Save everything
+            backgroundRealm.add(contentsResponse.rooms, update: .modified)
+            backgroundRealm.add(contentsResponse.tracks, update: .modified)
+            backgroundRealm.add(contentsResponse.events, update: .modified)
+
             contentsResponse.sessions.forEach { newSession in
                 // Replace any "unknown" resources with their full data
                 newSession.related.filter({$0.type == RelatedResourceType.unknown.rawValue}).forEach { unknownResource in
@@ -106,11 +115,12 @@ public final class Storage {
                 if let existingSession = backgroundRealm.object(ofType: Session.self, forPrimaryKey: newSession.identifier) {
                     existingSession.merge(with: newSession, in: backgroundRealm)
                 } else {
-                    backgroundRealm.add(newSession, update: .all)
+                    backgroundRealm.add(newSession, update: .modified)
                 }
             }
 
             // Merge existing instance data, preserving user-defined data
+            let mergeInstances = Self.signposter.beginInterval("store content result", id: Self.signposter.makeSignpostID(), "merge instances")
             contentsResponse.instances.forEach { newInstance in
                 if let existingInstance = backgroundRealm.object(ofType: SessionInstance.self, forPrimaryKey: newInstance.identifier) {
                     existingInstance.merge(with: newInstance, in: backgroundRealm)
@@ -123,56 +133,73 @@ public final class Storage {
                         newInstance.session = existingSession
                     }
 
-                    backgroundRealm.add(newInstance, update: .all)
+                    backgroundRealm.add(newInstance, update: .modified)
                 }
             }
-
-            // Save everything
-            backgroundRealm.add(contentsResponse.rooms, update: .all)
-            backgroundRealm.add(contentsResponse.tracks, update: .all)
-            backgroundRealm.add(contentsResponse.events, update: .all)
+            Self.signposter.endInterval("store content result", mergeInstances)
 
             // add instances to rooms
+            let instancesToRooms = Self.signposter.beginInterval("store content result", id: Self.signposter.makeSignpostID(), "add instances to rooms")
             backgroundRealm.objects(Room.self).forEach { room in
                 let instances = backgroundRealm.objects(SessionInstance.self).filter("roomIdentifier == %@", room.identifier)
 
-                instances.forEach({ $0.roomName = room.name })
-
                 room.instances.removeAll()
-                room.instances.append(objectsIn: instances)
+                instances.forEach {
+                    $0.roomName = room.name
+                    // append(contentsOf: other) just does a for loop so we avoid double iteration by doing this
+                    room.instances.append($0)
+                }
             }
+            Self.signposter.endInterval("store content result", instancesToRooms)
 
             // add instances and sessions to events
+            let instancesToEvents = Self.signposter.beginInterval("store content result", id: Self.signposter.makeSignpostID(), "add instances and sessions to events")
             backgroundRealm.objects(Event.self).forEach { event in
                 let instances = backgroundRealm.objects(SessionInstance.self).filter("eventIdentifier == %@", event.identifier)
                 let sessions = backgroundRealm.objects(Session.self).filter("eventIdentifier == %@", event.identifier)
 
                 event.sessionInstances.removeAll()
-                event.sessionInstances.append(objectsIn: instances)
+                event.sessionInstances.forEach {
+                    $0.session?.eventStartDate = event.startDate
+                    event.sessionInstances.append($0)
+                }
 
                 event.sessions.removeAll()
-                event.sessions.append(objectsIn: sessions)
+                sessions.forEach {
+                    $0.eventStartDate = event.startDate
+                    // append(contentsOf: other) just does a for loop so we avoid double iteration by doing this
+                    event.sessions.append($0)
+                }
             }
+            Self.signposter.endInterval("store content result", instancesToEvents)
 
             // add instances and sessions to tracks
+            let instancesToTracks = Self.signposter.beginInterval("store content result", id: Self.signposter.makeSignpostID(), "add instances and sessions to tracks")
             backgroundRealm.objects(Track.self).forEach { track in
                 let instances = backgroundRealm.objects(SessionInstance.self).filter("trackIdentifier == %@", track.identifier)
                 let sessions = backgroundRealm.objects(Session.self).filter("trackIdentifier == %@", track.identifier)
 
                 track.instances.removeAll()
-                track.instances.append(objectsIn: instances)
-
-                track.sessions.removeAll()
-                track.sessions.append(objectsIn: sessions)
-
-                sessions.forEach({ $0.trackName = track.name })
                 instances.forEach { instance in
                     instance.trackName = track.name
                     instance.session?.trackName = track.name
+                    instance.session?.trackOrder = track.order
+                    // append(contentsOf: other) just does a for loop so we avoid double iteration by doing this
+                    track.instances.append(instance)
+                }
+
+                track.sessions.removeAll()
+                sessions.forEach {
+                    $0.trackName = track.name
+                    $0.trackOrder = track.order
+                    // append(contentsOf: other) just does a for loop so we avoid double iteration by doing this
+                    track.sessions.append($0)
                 }
             }
+            Self.signposter.endInterval("store content result", instancesToTracks)
 
             // add live video assets to sessions
+            let liveVideoAssets = Self.signposter.beginInterval("store content result", id: Self.signposter.makeSignpostID(), "add live video assets to sessions")
             backgroundRealm.objects(SessionAsset.self).filter("rawAssetType == %@", SessionAssetType.liveStreamVideo.rawValue).forEach { liveAsset in
                 if let session = backgroundRealm.objects(Session.self).filter("ANY event.year == %d AND number == %@", liveAsset.year, liveAsset.sessionId).first {
                     if !session.assets.contains(liveAsset) {
@@ -180,40 +207,61 @@ public final class Storage {
                     }
                 }
             }
+            Self.signposter.endInterval("store content result", liveVideoAssets)
 
             // Associate session resources with Session objects in database
+            let sessionResources = Self.signposter.beginInterval("store content result", id: Self.signposter.makeSignpostID(), "associate session resources")
             backgroundRealm.objects(RelatedResource.self).filter("type == %@", RelatedResourceType.session.rawValue).forEach { resource in
                 if let session = backgroundRealm.object(ofType: Session.self, forPrimaryKey: resource.identifier) {
                     resource.session = session
                 }
             }
+            Self.signposter.endInterval("store content result", sessionResources)
+
+            // Remove tracks that don't include any future session instances nor any sessions with video/live video
+            let emptyTracksState = Self.signposter.beginInterval("store content result", id: Self.signposter.makeSignpostID(), "delete empty tracks")
+            let emptyTracks = backgroundRealm.objects(Track.self)
+                .filter("SUBQUERY(sessions, $session, ANY $session.assets.rawAssetType = %@ OR ANY $session.assets.rawAssetType = %@).@count == 0", SessionAssetType.streamingVideo.rawValue, SessionAssetType.liveStreamVideo.rawValue)
+            backgroundRealm.delete(emptyTracks)
+            Self.signposter.endInterval("store content result", emptyTracksState)
 
             // Create schedule view
-            backgroundRealm.delete(backgroundRealm.objects(ScheduleSection.self))
+            let createScheduleView = Self.signposter.beginInterval("store content result", id: Self.signposter.makeSignpostID(), "schedule view")
+            let sectionsInRealm = backgroundRealm.objects(ScheduleSection.self)
+            let instances = backgroundRealm.objects(SessionInstance.self)
 
-            let instances = backgroundRealm.objects(SessionInstance.self).sorted(by: SessionInstance.standardSort)
-
-            var previousStartTime: Date?
-            for instance in instances {
-                guard instance.startTime != previousStartTime else { continue }
-
-                autoreleasepool {
-                    let instancesForSection = instances.filter({ $0.startTime == instance.startTime })
-
-                    let section = ScheduleSection()
-
-                    section.representedDate = instance.startTime
-                    section.eventIdentifier = instance.eventIdentifier
-                    section.instances.removeAll()
-                    section.instances.append(objectsIn: instancesForSection)
-                    section.identifier = ScheduleSection.identifierFormatter.string(from: instance.startTime)
-
-                    backgroundRealm.add(section, update: .all)
-
-                    previousStartTime = instance.startTime
+            // Group all instances by common start time
+            // Technically, a secondary grouping on event should be used, in practice we haven't seen
+            // separate events that overlap in time. Someday this might hurt
+            // For content updates that don't really change much, like most of the year.
+            // Doing the diffing on the sections is an order of magnitude faster (28ms -> 4ms)
+            let newSections = Dictionary(grouping: instances, by: \.startTime)
+            var merged = Set<Date>()
+            sectionsInRealm.forEach { existing in
+                if let new = newSections[existing.representedDate] {
+                    // Section is in new and old, update it's instances
+                    existing.instances.removeAll()
+                    existing.instances.append(objectsIn: new)
+                    merged.insert(existing.representedDate)
+                } else {
+                    // Section is not in the new data, delete it
+                    backgroundRealm.delete(existing)
                 }
             }
-        }, disableAutorefresh: true, completionBlock: completion)
+
+            // Explicitly add new sections
+            newSections.filter { !merged.contains($0.key) }.forEach { startTime, instances in
+                let section = ScheduleSection()
+                section.representedDate = startTime
+                section.eventIdentifier = instances[0].eventIdentifier // 0 index ok, Dictionary grouping will never give us an empty array
+                section.instances.removeAll()
+                section.instances.append(objectsIn: instances)
+                section.identifier = ScheduleSection.identifierFormatter.string(from: startTime)
+
+                backgroundRealm.add(section, update: .modified)
+            }
+            Self.signposter.endInterval("store content result", createScheduleView)
+        }
     }
 
     internal func store(liveVideosResult: Result<[SessionAsset], APIError>) {
@@ -221,10 +269,7 @@ public final class Storage {
         do {
             assets = try liveVideosResult.get()
         } catch {
-            os_log("Error downloading live videos:\n%{public}@",
-                   log: log,
-                   type: .error,
-                   String(describing: error))
+            log.error("Error downloading live videos:\n\(String(describing: error), privacy: .public)")
             return
         }
 
@@ -234,13 +279,9 @@ public final class Storage {
             assets.forEach { asset in
                 asset.identifier = asset.generateIdentifier()
 
-                os_log("Registering live asset with year %{public}d and session number %{public}@",
-                       log: self.log,
-                       type: .info,
-                       asset.year,
-                       asset.sessionId)
+                self.log.info("Registering live asset with year \(asset.year, privacy: .public) and session number \(asset.sessionId, privacy: .public)")
 
-                backgroundRealm.add(asset, update: .all)
+                backgroundRealm.add(asset, update: .modified)
 
                 if let session = backgroundRealm.objects(Session.self).filter("identifier == %@", asset.sessionId).first {
                     if !session.assets.contains(asset) {
@@ -256,15 +297,12 @@ public final class Storage {
         do {
             sections = try featuredSectionsResult.get()
         } catch {
-            os_log("Error downloading featured sections:\n%{public}@",
-                   log: log,
-                   type: .error,
-                   String(describing: error))
+            log.error("Error downloading featured sections:\n\(String(describing: error), privacy: .public)")
             completion(error)
             return
         }
 
-        performSerializedBackgroundWrite(writeBlock: { backgroundRealm in
+        performSerializedBackgroundWrite(disableAutorefresh: true, completionBlock: completion) { backgroundRealm in
             let existingSections = backgroundRealm.objects(FeaturedSection.self)
             for section in existingSections {
                 section.content.forEach { backgroundRealm.delete($0) }
@@ -272,7 +310,7 @@ public final class Storage {
                 backgroundRealm.delete(section)
             }
 
-            backgroundRealm.add(sections, update: .all)
+            backgroundRealm.add(sections, update: .modified)
 
             // Associate contents with sessions
             sections.forEach { section in
@@ -280,7 +318,7 @@ public final class Storage {
                     content.session = backgroundRealm.object(ofType: Session.self, forPrimaryKey: content.sessionId)
                 }
             }
-        }, disableAutorefresh: true, completionBlock: completion)
+        }
     }
 
     internal func store(configResult: Result<ConfigResponse, APIError>, completion: @escaping (Error?) -> Void) {
@@ -289,97 +327,25 @@ public final class Storage {
         do {
             response = try configResult.get()
         } catch {
-            os_log("Error downloading config:\n%{public}@",
-                   log: log,
-                   type: .error,
-                   String(describing: error))
+            log.error("Error downloading config:\n\(String(describing: error), privacy: .public)")
             completion(error)
             return
         }
         
-        performSerializedBackgroundWrite(writeBlock: { backgroundRealm in
+        performSerializedBackgroundWrite(disableAutorefresh: false, completionBlock: completion) { backgroundRealm in
             // We currently only care about whatever the latest event hero is.
             let existingHeroData = backgroundRealm.objects(EventHero.self)
             backgroundRealm.delete(existingHeroData)
-        }, disableAutorefresh: false, completionBlock: completion)
+        }
 
         guard let hero = response.eventHero else {
-            os_log("Config response didn't contain an event hero", log: self.log, type: .debug)
+            log.debug("Config response didn't contain an event hero")
             return
         }
 
-        performSerializedBackgroundWrite(writeBlock: { backgroundRealm in
-            backgroundRealm.add(hero, update: .all)
-        }, disableAutorefresh: false, completionBlock: completion)
-    }
-
-    internal func store(cocoaHubNewsResult result: Result<CocoaHubIndexResponse, APIError>, completion: @escaping (Error?) -> Void) {
-        let response: CocoaHubIndexResponse
-
-        do {
-            response = try result.get()
-        } catch {
-            os_log("Error downloading CocoaHub news:\n%{public}@",
-                   log: log,
-                   type: .error,
-                   String(describing: error))
-            completion(error)
-            return
+        performSerializedBackgroundWrite(disableAutorefresh: false, completionBlock: completion) { backgroundRealm in
+            backgroundRealm.add(hero, update: .modified)
         }
-
-        performSerializedBackgroundWrite(writeBlock: { backgroundRealm in
-            response.tags.forEach { tag in
-                backgroundRealm.add(tag, update: .modified)
-            }
-            response.news.forEach { item in
-                item.rawTags.forEach { tagName in
-                    guard let tag = response.tags.first(where: { $0.name == tagName }) else { return }
-
-                    item.tags.append(tag)
-                }
-            }
-            
-            backgroundRealm.add(response.news, update: .modified)
-
-            response.editions.forEach { edition in
-                if let existingEdition = backgroundRealm.object(ofType: CocoaHubEdition.self, forPrimaryKey: edition.id) {
-                    existingEdition.merge(with: edition)
-                } else {
-                    backgroundRealm.add(edition, update: .all)
-                }
-            }
-        }, disableAutorefresh: false, completionBlock: completion)
-    }
-
-    internal func store(cocoaHubEditionArticles result: Result<CocoaHubEditionResponse, APIError>, completion: @escaping (Error?) -> Void) {
-        let response: CocoaHubEditionResponse
-
-        do {
-            response = try result.get()
-        } catch {
-            os_log("Error downloading CocoaHub edition:\n%{public}@",
-                   log: log,
-                   type: .error,
-                   String(describing: error))
-            completion(error)
-            return
-        }
-
-        let editionId = response._id
-
-        performSerializedBackgroundWrite(writeBlock: { backgroundRealm in
-            guard let edition = backgroundRealm.object(ofType: CocoaHubEdition.self, forPrimaryKey: editionId) else { return }
-
-            response.articles.forEach { article in
-                if let index = edition.articles.index(of: article) {
-                    edition.articles[index] = article
-                } else {
-                    edition.articles.append(article)
-                }
-            }
-
-            backgroundRealm.add(edition, update: .modified)
-        }, disableAutorefresh: false, completionBlock: completion)
     }
 
     private let serialQueue = DispatchQueue(label: "Database Serial", qos: .userInteractive)
@@ -392,11 +358,11 @@ public final class Storage {
     ///   - createTransaction: Whether the method should create its own write transaction or use the one already in place
     ///   - notificationTokensToSkip: An array of `NotificationToken` that should not be notified when the write is committed
     ///   - completionBlock: A block to be called when the operation is completed (called on the main queue)
-    internal func performSerializedBackgroundWrite(writeBlock: @escaping (Realm) throws -> Void,
-                                                   disableAutorefresh: Bool = false,
+    internal func performSerializedBackgroundWrite(disableAutorefresh: Bool = false,
                                                    createTransaction: Bool = true,
                                                    notificationTokensToSkip: [NotificationToken] = [],
-                                                   completionBlock: ((Error?) -> Void)? = nil) {
+                                                   completionBlock: ((Error?) -> Void)? = nil,
+                                                   writeBlock: @escaping (Realm) throws -> Void) {
         if disableAutorefresh { realm.autorefresh = false }
 
         serialQueue.async {
@@ -456,13 +422,13 @@ public final class Storage {
     public func modify<T>(_ object: T, with writeBlock: @escaping (T) -> Void) where T: ThreadConfined {
         let safeObject = ThreadSafeReference(to: object)
 
-        performSerializedBackgroundWrite(writeBlock: { backgroundRealm in
+        performSerializedBackgroundWrite(createTransaction: false, writeBlock: { backgroundRealm in
             guard let resolvedObject = backgroundRealm.resolve(safeObject) else { return }
 
             try backgroundRealm.write {
                 writeBlock(resolvedObject)
             }
-        }, createTransaction: false)
+        })
     }
 
     /// Gives you an opportunity to update `objects` on a background queue
@@ -476,32 +442,30 @@ public final class Storage {
     ///   it is not guaranteed that your writeBlock will be called.
     ///   Your write block is not called if any of the objects can't be transfered between threads.
     public func modify<T>(_ objects: [T], with writeBlock: @escaping ([T]) -> Void) where T: ThreadConfined {
+        guard !objects.isEmpty else { return }
+
         let safeObjects = objects.map { ThreadSafeReference(to: $0) }
 
-        performSerializedBackgroundWrite(writeBlock: { [weak self] backgroundRealm in
+        performSerializedBackgroundWrite(createTransaction: false, writeBlock: { [weak self] backgroundRealm in
             guard let self = self else { return }
 
             let resolvedObjects = safeObjects.compactMap { backgroundRealm.resolve($0) }
 
             guard resolvedObjects.count == safeObjects.count else {
-                os_log("A background database modification failed because some objects couldn't be resolved'", log: self.log, type: .fault)
+                log.fault("A background database modification failed because some objects couldn't be resolved'")
                 return
             }
 
             try backgroundRealm.write {
                 writeBlock(resolvedObjects)
             }
-        }, createTransaction: false)
+        })
     }
 
-    public lazy var events: Observable<Results<Event>> = {
+    public lazy var events: some Publisher<Results<Event>, Error> = {
         let eventsSortedByDateDescending = self.realm.objects(Event.self).sorted(byKeyPath: "startDate", ascending: false)
 
-        return Observable.collection(from: eventsSortedByDateDescending)
-    }()
-
-    public lazy var sessionsObservable: Observable<Results<Session>> = {
-        return Observable.collection(from: self.realm.objects(Session.self))
+        return eventsSortedByDateDescending.collectionPublisher
     }()
 
     public var sessions: Results<Session> {
@@ -517,9 +481,9 @@ public final class Storage {
     }
     
     public func setFavorite(_ isFavorite: Bool, onSessionsWithIDs ids: [String]) {
-        performSerializedBackgroundWrite(writeBlock: { realm in
+        performSerializedBackgroundWrite(disableAutorefresh: false, createTransaction: true, writeBlock: { realm in
             let sessions = realm.objects(Session.self).filter(NSPredicate(format: "identifier IN %@", ids))
-            
+
             sessions.forEach { session in
                 if isFavorite {
                     guard !session.isFavorite else { return }
@@ -528,68 +492,40 @@ public final class Storage {
                     session.favorites.forEach { $0.isDeleted = true }
                 }
             }
-        }, disableAutorefresh: false, createTransaction: true)
+        })
     }
 
-    public lazy var eventsObservable: Observable<Results<Event>> = {
-        let events = realm.objects(Event.self).sorted(byKeyPath: "startDate", ascending: false)
-
-        return Observable.collection(from: events)
-    }()
-
-    public lazy var focusesObservable: Observable<Results<Focus>> = {
+    public lazy var focuses: some Publisher<Results<Focus>, Error> = {
         let focuses = realm.objects(Focus.self).sorted(byKeyPath: "name")
 
-        return Observable.collection(from: focuses)
+        return focuses.changesetPublisherShallow(keyPaths: ["name"])
     }()
 
-    public lazy var tracksObservable: Observable<Results<Track>> = {
-        let tracks = self.realm.objects(Track.self).sorted(byKeyPath: "order")
-
-        return Observable.collection(from: tracks)
+    public lazy var tracks: some Publisher<Results<Track>, Error> = {
+        realm.objects(Track.self).sorted(byKeyPath: "order").changesetPublisherShallow(keyPaths: ["identifier"])
     }()
 
-    public lazy var featuredSectionsObservable: Observable<Results<FeaturedSection>> = {
+    public lazy var featuredSections: some Publisher<Results<FeaturedSection>, Error> = {
         let predicate = NSPredicate(format: "isPublished = true AND content.@count > 0")
         let sections = self.realm.objects(FeaturedSection.self).filter(predicate)
 
-        return Observable.collection(from: sections)
+        return sections.collectionPublisher
     }()
 
-    public lazy var scheduleObservable: Observable<Results<ScheduleSection>> = {
+    public lazy var scheduleSections: some Publisher<Results<ScheduleSection>, Error> = {
         let currentEvents = self.realm.objects(Event.self).filter("isCurrent == true")
 
-        return Observable.collection(from: currentEvents).map({ $0.first?.identifier }).flatMap { (identifier: String?) -> Observable<Results<ScheduleSection>> in
+        return currentEvents.changesetPublisherShallow(keyPaths: ["identifier"]).map({ $0.first?.identifier }).flatMap { (identifier: String?) -> AnyPublisher<Results<ScheduleSection>, Error> in
             let sections = self.realm.objects(ScheduleSection.self).filter("eventIdentifier == %@", identifier ?? "").sorted(byKeyPath: "representedDate")
 
-            return Observable.collection(from: sections)
+            return sections.changesetPublisherShallow(keyPaths: ["identifier"]).eraseToAnyPublisher()
         }
     }()
 
-    public lazy var eventHeroObservable: Observable<EventHero?> = {
+    public lazy var eventHeroObservable: some Publisher<EventHero?, Error> = {
         let hero = self.realm.objects(EventHero.self)
 
-        return Observable.collection(from: hero).map { $0.first }
-    }()
-
-    public lazy var communityNewsItemsObservable: Observable<Results<CommunityNewsItem>> = {
-        let predicate = NSPredicate(format: "summary != nil AND isFeatured = false")
-        let items = realm.objects(CommunityNewsItem.self).filter(predicate).sorted(byKeyPath: "date", ascending: false)
-
-        return Observable.collection(from: items)
-    }()
-
-    public lazy var featuredCommunityNewsItemsObservable: Observable<Results<CommunityNewsItem>> = {
-        let predicate = NSPredicate(format: "summary != nil AND isFeatured = true")
-        let items = realm.objects(CommunityNewsItem.self).filter(predicate).sorted(byKeyPath: "date", ascending: false)
-
-        return Observable.collection(from: items)
-    }()
-
-    public lazy var cocoaHubEditionsObservable: Observable<Results<CocoaHubEdition>> = {
-        let items = realm.objects(CocoaHubEdition.self).sorted(byKeyPath: "index", ascending: false)
-
-        return Observable.collection(from: items)
+        return hero.collectionPublisher.map { $0.first }
     }()
 
     public func asset(with remoteURL: URL) -> SessionAsset? {
@@ -604,7 +540,7 @@ public final class Storage {
 
     public func deleteBookmark(with identifier: String) {
         guard let bookmark = bookmark(with: identifier) else {
-            os_log("DELETE ERROR: Bookmark not found with identifier %{public}@", log: log, type: .error, identifier)
+            log.error("DELETE ERROR: Bookmark not found with identifier \(identifier, privacy: .public)")
             return
         }
 
@@ -615,7 +551,7 @@ public final class Storage {
 
     public func softDeleteBookmark(with identifier: String) {
         guard let bookmark = bookmark(with: identifier) else {
-            os_log("SOFT DELETE ERROR: Bookmark not found with identifier %{public}@", log: log, type: .error, identifier)
+            log.error("SOFT DELETE ERROR: Bookmark not found with identifier \(identifier, privacy: .public)")
             return
         }
 
@@ -627,7 +563,7 @@ public final class Storage {
 
     public func moveBookmark(with identifier: String, to timecode: Double) {
         guard let bookmark = bookmark(with: identifier) else {
-            os_log("MOVE ERROR: Bookmark not found with identifier %{public}@", log: log, type: .error, identifier)
+            log.error("MOVE ERROR: Bookmark not found with identifier \(identifier, privacy: .public)")
             return
         }
 
@@ -648,16 +584,21 @@ public final class Storage {
         }
     }
 
-    public var allEvents: [Event] {
-        return realm.objects(Event.self).sorted(byKeyPath: "startDate", ascending: false).toArray()
+    public var eventsForFiltering: some Publisher<Results<Event>, Error> {
+        return realm.objects(Event.self)
+            .filter("SUBQUERY(sessions, $session, ANY $session.assets.rawAssetType == %@).@count > %d", SessionAssetType.streamingVideo.rawValue, 0)
+            .sorted(byKeyPath: "startDate", ascending: false)
+            .changesetPublisherShallow(keyPaths: ["identifier"])
     }
 
-    public var allFocuses: [Focus] {
-        return realm.objects(Focus.self).sorted(byKeyPath: "name").toArray()
-    }
-
-    public var allTracks: [Track] {
-        return realm.objects(Track.self).sorted(byKeyPath: "order").toArray()
+    public var allSessionTypes: some Publisher<[String], Error> {
+        realm
+            .objects(SessionInstance.self)
+            .changesetPublisherShallow(keyPaths: ["identifier"])
+            .map {
+                Array(Set($0.map(\.rawSessionType)))
+                    .sorted(by: { $0.localizedStandardCompare($1) == .orderedAscending })
+            }
     }
 
 }

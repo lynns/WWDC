@@ -7,14 +7,17 @@
 //
 
 import Cocoa
-import os.log
+import OSLog
+import ConfCore
+
+extension CALayer: Logging {
+    public static let log = makeLogger()
+}
 
 public extension CALayer {
 
     /// Temporary storage for animations that have been disabled by `disableAllAnimations`
     private static var _animationStorage: [Int: [String: CAAnimation]] = [:]
-
-    private static let log = OSLog(subsystem: "WWDC", category: "CALayer+Asset")
 
     /// Loads a `CALayer` from a Core Animation Archive asset.
     ///
@@ -25,29 +28,32 @@ public extension CALayer {
     static func load(assetNamed assetName: String, bundle: Bundle = .main) -> CALayer? {
         guard let asset = NSDataAsset(name: assetName, bundle: bundle) else {
             assertionFailure("Asset not found")
-            os_log("Missing asset %{public}@", log: CALayer.log, type: .fault, assetName)
+            log.fault("Missing asset \(assetName, privacy: .public)")
             return nil
         }
 
         do {
-            let rootObject = try NSKeyedUnarchiver.unarchiveTopLevelObjectWithData(asset.data)
+            let unarchiver = try NSKeyedUnarchiver(forReadingFrom: asset.data)
+            unarchiver.requiresSecureCoding = false
+
+            let rootObject = unarchiver.decodeObject(forKey: NSKeyedArchiveRootObjectKey)
 
             guard let dictionary = rootObject as? NSDictionary else {
                 assertionFailure("Failed to load asset")
-                os_log("Failed to load asset %{public}@", log: CALayer.log, type: .fault, assetName)
+                log.fault("Failed to load asset \(assetName, privacy: .public)")
                 return nil
             }
 
             guard let layer = dictionary["rootLayer"] as? CALayer else {
                 assertionFailure("Root layer not found")
-                os_log("Failed to load root layer from asset %{public}@", log: CALayer.log, type: .fault, assetName)
+                log.fault("Failed to load root layer from asset \(assetName, privacy: .public)")
                 return nil
             }
 
             return layer
         } catch {
             assertionFailure(String(describing: error))
-            os_log("Unarchive failed: %{public}@", log: self.log, type: .fault, String(describing: error))
+            log.fault("Unarchive failed: \(String(describing: error), privacy: .public)")
             return nil
         }
     }

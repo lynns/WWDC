@@ -7,8 +7,7 @@
 //
 
 import Cocoa
-import RxSwift
-import RxCocoa
+import Combine
 import ConfCore
 
 extension NSStoryboard.Name {
@@ -19,7 +18,7 @@ extension NSStoryboard.SceneIdentifier {
     static let generalPreferencesViewController = NSStoryboard.SceneIdentifier("GeneralPreferencesViewController")
 }
 
-class GeneralPreferencesViewController: NSViewController {
+final class GeneralPreferencesViewController: WWDCWindowContentViewController {
 
     #if ICLOUD
     weak var userDataSyncEngine: UserDataSyncEngine? {
@@ -40,12 +39,13 @@ class GeneralPreferencesViewController: NSViewController {
         return vc
     }
 
+    @IBOutlet weak var downloadsStackView: NSStackView?
+
     @IBOutlet weak var searchInTranscriptsSwitch: NSSwitch!
     @IBOutlet weak var searchInBookmarksSwitch: NSSwitch!
     @IBOutlet weak var refreshPeriodicallySwitch: NSSwitch!
     @IBOutlet weak var enableUserDataSyncSwitch: NSSwitch!
-    @IBOutlet weak var enableWWDCAgentSwitch: NSSwitch!
-    
+
     @IBOutlet weak var downloadsFolderLabel: NSTextField!
 
     @IBOutlet weak var downloadsFolderIntroLabel: NSTextField!
@@ -65,7 +65,8 @@ class GeneralPreferencesViewController: NSViewController {
     @IBOutlet weak var dividerB: NSBox!
     @IBOutlet weak var dividerC: NSBox!
     @IBOutlet weak var dividerE: NSBox!
-    @IBOutlet weak var dividerF: NSBox!
+
+    override var viewForWindowTopSafeAreaConstraint: NSView? { downloadsStackView }
     
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -89,7 +90,6 @@ class GeneralPreferencesViewController: NSViewController {
         searchInBookmarksSwitch.isOn = Preferences.shared.searchInBookmarks
         refreshPeriodicallySwitch.isOn = Preferences.shared.refreshPeriodically
         enableUserDataSyncSwitch.isOn = Preferences.shared.syncUserData
-        enableWWDCAgentSwitch.isOn = WWDCAgentController.isAgentEnabled
 
         downloadsFolderLabel.stringValue = Preferences.shared.localVideoStorageURL.path
 
@@ -104,19 +104,17 @@ class GeneralPreferencesViewController: NSViewController {
         languagesProvider.fetchAvailableLanguages()
     }
 
-    private let disposeBag = DisposeBag()
-
-    private var dummyRelay = BehaviorRelay<Bool>(value: false)
+    private var cancellables: Set<AnyCancellable> = []
 
     private func bindSyncEngine() {
         #if ICLOUD
         guard let engine = userDataSyncEngine, isViewLoaded else { return }
 
         // Disable sync switch while there are sync operations running
-        engine.isPerformingSyncOperation.asDriver()
-                                        .map({ !$0 })
-                                        .drive(enableUserDataSyncSwitch.rx.isEnabled)
-                                        .disposed(by: disposeBag)
+        engine.$isPerformingSyncOperation.sink { [weak self] in
+            self?.enableUserDataSyncSwitch.isEnabled = !$0
+        }
+        .store(in: &cancellables)
         #else
         enableUserDataSyncSwitch?.isHidden = true
         syncDescriptionLabel?.isHidden = true
@@ -126,16 +124,14 @@ class GeneralPreferencesViewController: NSViewController {
     private func bindTranscriptIndexingState() {
         // Disable transcript language pop up while indexing transcripts.
 
-        syncEngine.isIndexingTranscripts.asDriver()
-                                        .map({ !$0 })
-                                        .drive(transcriptLanguagesPopUp.rx.isEnabled)
-                                        .disposed(by: disposeBag)
+        syncEngine.isIndexingTranscripts.toggled()
+            .replaceError(with: true)
+            .driveUI(\.isEnabled, on: transcriptLanguagesPopUp)
+            .store(in: &cancellables)
 
         // Show indexing progress while indexing.
 
-        syncEngine.isIndexingTranscripts.asObservable()
-                                         .observe(on: MainScheduler.instance)
-                                         .bind { [weak self] isIndexing in
+        syncEngine.isIndexingTranscripts.driveUI { [weak self] isIndexing in
             guard let self = self else { return }
 
             if isIndexing {
@@ -147,13 +143,11 @@ class GeneralPreferencesViewController: NSViewController {
                 self.indexingProgressIndicator?.isHidden = true
                 self.indexingProgressIndicator?.stopAnimation(nil)
             }
-        }.disposed(by: disposeBag)
+        }.store(in: &cancellables)
 
-        syncEngine.transcriptIndexingProgress.asObservable()
-                                             .observe(on: MainScheduler.instance)
-                                             .bind { [weak self] progress in
+        syncEngine.transcriptIndexingProgress.driveUI { [weak self] progress in
             self?.indexingProgressIndicator?.doubleValue = Double(progress)
-        }.disposed(by: disposeBag)
+        }.store(in: &cancellables)
     }
 
     @IBAction func searchInTranscriptsSwitchAction(_ sender: Any) {
@@ -173,19 +167,6 @@ class GeneralPreferencesViewController: NSViewController {
         Preferences.shared.syncUserData = enableUserDataSyncSwitch.isOn
         userDataSyncEngine?.isEnabled = enableUserDataSyncSwitch.isOn
         #endif
-    }
-    
-    private lazy var agentController = WWDCAgentController()
-
-    @IBAction func enableWWDCAgentSwitchAction(_ sender: NSSwitch) {
-        if sender.isOn {
-            let success = agentController.enableAgent()
-
-            // The agent installation might fail (rare), in which case we disable the switch again.
-            DispatchQueue.main.async { sender.isOn = success }
-        } else {
-            agentController.disableAgent()
-        }
     }
     
     // MARK: - Downloads folder
@@ -250,7 +231,7 @@ class GeneralPreferencesViewController: NSViewController {
 
         var rootFileCount = 0
 
-        while let _ = enumerator.nextObject() as? String {
+        while enumerator.nextObject() as? String != nil {
             rootFileCount += 1
         }
 
@@ -290,11 +271,10 @@ class GeneralPreferencesViewController: NSViewController {
         showLanguagesLoading()
 
         languagesProvider.availableLanguageCodes
-            .observe(on: MainScheduler.instance)
-            .bind { [weak self] languages in
+            .driveUI { [weak self] languages in
                 self?.populateLanguagesPopUp(with: languages)
             }
-            .disposed(by: disposeBag)
+            .store(in: &cancellables)
     }
 
     private func populateLanguagesPopUp(with languages: [TranscriptLanguage]) {

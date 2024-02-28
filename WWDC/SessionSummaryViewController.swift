@@ -7,15 +7,14 @@
 //
 
 import Cocoa
-import RxSwift
-import RxCocoa
 import ConfCore
+import Combine
 
 class SessionSummaryViewController: NSViewController {
 
-    private var disposeBag = DisposeBag()
+    private var cancellables: Set<AnyCancellable> = []
 
-    var viewModel: SessionViewModel? = nil {
+    var viewModel: SessionViewModel? {
         didSet {
             updateBindings()
         }
@@ -35,7 +34,7 @@ class SessionSummaryViewController: NSViewController {
 
     private lazy var titleLabel: WWDCTextField = {
         let l = WWDCTextField(labelWithString: "")
-        l.cell?.backgroundStyle = .dark
+        l.cell?.backgroundStyle = .emphasized
         l.lineBreakMode = .byWordWrapping
         l.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         l.allowsDefaultTighteningForTruncation = true
@@ -58,6 +57,7 @@ class SessionSummaryViewController: NSViewController {
 
     lazy var relatedSessionsViewController: RelatedSessionsViewController = {
         let c = RelatedSessionsViewController()
+        c.view.translatesAutoresizingMaskIntoConstraints = false
 
         c.title = "Related Sessions"
 
@@ -67,7 +67,7 @@ class SessionSummaryViewController: NSViewController {
     private func attributedSummaryString(from string: String) -> NSAttributedString {
         .create(with: string, font: .systemFont(ofSize: 15), color: .secondaryText, lineHeightMultiple: 1.2)
     }
-    
+
     private lazy var summaryTextView: NSTextView = {
         let v = NSTextView()
 
@@ -104,7 +104,7 @@ class SessionSummaryViewController: NSViewController {
         let l = NSTextField(labelWithString: "")
         l.font = .systemFont(ofSize: 16)
         l.textColor = .tertiaryText
-        l.cell?.backgroundStyle = .dark
+        l.cell?.backgroundStyle = .emphasized
         l.lineBreakMode = .byTruncatingTail
         l.allowsDefaultTighteningForTruncation = true
 
@@ -171,7 +171,6 @@ class SessionSummaryViewController: NSViewController {
         summaryScrollView.heightAnchor.constraint(equalToConstant: Metrics.summaryHeight).isActive = true
 
         addChild(relatedSessionsViewController)
-        relatedSessionsViewController.view.translatesAutoresizingMaskIntoConstraints = false
         stackView.addArrangedSubview(relatedSessionsViewController.view)
         relatedSessionsViewController.view.heightAnchor.constraint(equalToConstant: RelatedSessionsViewController.Metrics.height).isActive = true
         relatedSessionsViewController.view.leadingAnchor.constraint(equalTo: stackView.leadingAnchor).isActive = true
@@ -191,28 +190,34 @@ class SessionSummaryViewController: NSViewController {
 
         guard let viewModel = viewModel else { return }
 
-        disposeBag = DisposeBag()
+        cancellables = []
 
-        viewModel.rxTitle.map(NSAttributedString.attributedBoldTitle(with:)).subscribe(onNext: { [weak self] title in
-            self?.titleLabel.attributedStringValue = title
-        }).disposed(by: disposeBag)
-        viewModel.rxFooter.bind(to: contextLabel.rx.text).disposed(by: disposeBag)
+        viewModel
+            .rxTitle
+            .replaceError(with: "")
+            .map(NSAttributedString.attributedBoldTitle(with:))
+            .driveUI(\.attributedStringValue, on: titleLabel)
+            .store(in: &cancellables)
+        viewModel.rxFooter.replaceError(with: "").driveUI(\.stringValue, on: contextLabel).store(in: &cancellables)
 
-        viewModel.rxSummary.subscribe(onNext: { [weak self] summary in
+        viewModel.rxSummary.driveUI { [weak self] summary in
             guard let self = self else { return }
             guard let textStorage = self.summaryTextView.textStorage else { return }
             let range = NSRange(location: 0, length: textStorage.length)
             textStorage.replaceCharacters(in: range, with: self.attributedSummaryString(from: summary))
-        }).disposed(by: disposeBag)
+        }
+        .store(in: &cancellables)
 
-        viewModel.rxRelatedSessions.subscribe(onNext: { [weak self] relatedResources in
+        viewModel.rxRelatedSessions.driveUI { [weak self] relatedResources in
             let relatedSessions = relatedResources.compactMap({ $0.session })
             self?.relatedSessionsViewController.sessions = relatedSessions.compactMap(SessionViewModel.init)
-        }).disposed(by: disposeBag)
+        }
+        .store(in: &cancellables)
 
         relatedSessionsViewController.scrollToBeginningOfDocument(nil)
 
-        viewModel.rxActionPrompt.bind(to: actionLinkLabel.rx.text).disposed(by: disposeBag)
+        // TODO: Not even sure what this does
+        viewModel.rxActionPrompt.replaceNilAndError(with: "").driveUI(\.stringValue, on: actionLinkLabel).store(in: &cancellables)
     }
 
     @objc private func clickedActionLabel() {

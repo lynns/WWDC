@@ -8,7 +8,7 @@
 
 import Cocoa
 import AVFoundation
-import os.log
+import OSLog
 
 protocol PUITimelineViewDelegate: AnyObject {
 
@@ -23,7 +23,7 @@ public final class PUITimelineView: NSView {
 
     typealias AnnotationTuple = (annotation: PUITimelineAnnotation, layer: PUIAnnotationLayer)
 
-    private let log = OSLog(subsystem: "PlayerUI", category: "PUITimelineView")
+    private let log = Logger(subsystem: "PlayerUI", category: "PUITimelineView")
 
     // MARK: - Public API
 
@@ -55,17 +55,15 @@ public final class PUITimelineView: NSView {
         didSet {
             if isEditingAnnotation {
                 // This isn't supported because the entire annotation UI gets rebuilt
-                os_log("Changing the annotations during an edit is unsupported", log: log, type: .error)
+                log.error("Changing the annotations during an edit is unsupported")
             }
             layoutAnnotations()
         }
     }
 
-    public var mediaDuration: Double = 0 {
-        didSet {
-            needsLayout = true
-        }
-    }
+    @MainActor
+    @Invalidating(.layout)
+    public var mediaDuration: Double = 0
 
     public var hasValidMediaDuration: Bool {
         return AVPlayer.validateMediaDurationWithSeconds(mediaDuration)
@@ -262,7 +260,6 @@ public final class PUITimelineView: NSView {
 
     public override var mouseDownCanMoveWindow: Bool {
         get { return false }
-        // swiftlint:disable:next unused_setter_value
         set { }
     }
 
@@ -303,7 +300,7 @@ public final class PUITimelineView: NSView {
 
                     let timestamp = self.mediaDuration * progress
 
-                    os_log("Force touch at %{public}f", log: log, type: .debug, timestamp)
+                    log.debug("Force touch at \(timestamp, privacy: .public)")
 
                     self.viewDelegate?.timelineDidReceiveForceTouch(at: timestamp)
 

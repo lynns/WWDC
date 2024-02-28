@@ -7,8 +7,6 @@
 //
 
 import Cocoa
-import RxSwift
-import RxCocoa
 
 private extension NSUserInterfaceItemIdentifier {
     static let sessionItem = NSUserInterfaceItemIdentifier("sessionCell")
@@ -37,8 +35,6 @@ final class RelatedSessionsViewController: NSViewController {
         static let padding: CGFloat = 24
     }
 
-    private let disposeBag = DisposeBag()
-
     var sessions: [SessionViewModel] = [] {
         didSet {
             collectionView.reloadData()
@@ -56,7 +52,7 @@ final class RelatedSessionsViewController: NSViewController {
 
     private lazy var titleLabel: WWDCTextField = {
         let l = WWDCTextField(labelWithString: "")
-        l.cell?.backgroundStyle = .dark
+        l.cell?.backgroundStyle = .emphasized
         l.lineBreakMode = .byTruncatingTail
         l.maximumNumberOfLines = 1
         l.translatesAutoresizingMaskIntoConstraints = false
@@ -117,6 +113,9 @@ final class RelatedSessionsViewController: NSViewController {
         view.addSubview(titleLabel)
         titleLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor).isActive = true
         titleLabel.topAnchor.constraint(equalTo: view.topAnchor).isActive = true
+
+        // Stay hidden until we get related sessions to show
+        view.isHidden = true
     }
 
     override func viewDidLoad() {

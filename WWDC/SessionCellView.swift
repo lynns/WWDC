@@ -7,12 +7,12 @@
 //
 
 import Cocoa
-import RxSwift
-import RxCocoa
+import Combine
+import RealmSwift
 
 final class SessionCellView: NSView {
 
-    private var disposeBag = DisposeBag()
+    private var cancellables: Set<AnyCancellable> = []
 
     var viewModel: SessionViewModel? {
         didSet {
@@ -45,33 +45,19 @@ final class SessionCellView: NSView {
     }
 
     private func bindUI() {
-        disposeBag = DisposeBag()
+        cancellables = []
 
         guard let viewModel = viewModel else { return }
 
-        viewModel.rxTitle.distinctUntilChanged().asDriver(onErrorJustReturn: "").drive(titleLabel.rx.text).disposed(by: disposeBag)
-        viewModel.rxSubtitle.distinctUntilChanged().asDriver(onErrorJustReturn: "").drive(subtitleLabel.rx.text).disposed(by: disposeBag)
-        viewModel.rxContext.distinctUntilChanged().asDriver(onErrorJustReturn: "").drive(contextLabel.rx.text).disposed(by: disposeBag)
+        titleLabel.stringValue = viewModel.title
+        viewModel.rxTitle.replaceError(with: "").driveUI(\.stringValue, on: titleLabel).store(in: &cancellables)
+        viewModel.rxSubtitle.replaceError(with: "").driveUI(\.stringValue, on: subtitleLabel).store(in: &cancellables)
+        viewModel.rxContext.replaceError(with: "").driveUI(\.stringValue, on: contextLabel).store(in: &cancellables)
 
-        viewModel.rxIsFavorite.distinctUntilChanged().map({ !$0 }).bind(to: favoritedImageView.rx.isHidden).disposed(by: disposeBag)
-        viewModel.rxIsDownloaded.distinctUntilChanged().map({ !$0 }).bind(to: downloadedImageView.rx.isHidden).disposed(by: disposeBag)
+        viewModel.rxIsFavorite.toggled().replaceError(with: true).driveUI(\.isHidden, on: favoritedImageView).store(in: &cancellables)
+        viewModel.rxIsDownloaded.toggled().replaceError(with: true).driveUI(\.isHidden, on: downloadedImageView).store(in: &cancellables)
 
-        let isSnowFlake = Observable.zip(viewModel.rxIsCurrentlyLive, viewModel.rxIsLab)
-
-        isSnowFlake.map({ !$0.0 && !$0.1 }).bind(to: snowFlakeView.rx.isHidden).disposed(by: disposeBag)
-        isSnowFlake.map({ $0.0 || $0.1 }).bind(to: thumbnailImageView.rx.isHidden).disposed(by: disposeBag)
-
-        isSnowFlake.subscribe(onNext: { [weak self] (isLive: Bool, isLab: Bool) -> Void in
-            if isLive {
-                self?.snowFlakeView.image = #imageLiteral(resourceName: "live-indicator")
-            } else if isLab {
-                self?.snowFlakeView.image = #imageLiteral(resourceName: "lab-indicator")
-            }
-        }).disposed(by: disposeBag)
-
-        viewModel.rxImageUrl.distinctUntilChanged({ $0 != $1 }).subscribe(onNext: { [weak self] imageUrl in
-            guard let imageUrl = imageUrl else { return }
-
+        viewModel.rxImageUrl.removeDuplicates().replaceErrorWithEmpty().compacted().sink { [weak self] imageUrl in
             self?.imageDownloadOperation?.cancel()
 
             self?.imageDownloadOperation = ImageDownloadCenter.shared.downloadImage(from: imageUrl, thumbnailHeight: Constants.thumbnailHeight, thumbnailOnly: true) { [weak self] url, result in
@@ -79,17 +65,18 @@ final class SessionCellView: NSView {
 
                 self?.thumbnailImageView.image = result.thumbnail
             }
-        }).disposed(by: disposeBag)
+        }
+        .store(in: &cancellables)
 
-        viewModel.rxColor.distinctUntilChanged({ $0 == $1 }).subscribe(onNext: { [weak self] color in
+        viewModel.rxColor.removeDuplicates().replaceErrorWithEmpty().sink(receiveValue: { [weak self] color in
             self?.contextColorView.color = color
-        }).disposed(by: disposeBag)
+        }).store(in: &cancellables)
 
-        viewModel.rxDarkColor.distinctUntilChanged({ $0 == $1 }).subscribe(onNext: { [weak self] color in
+        viewModel.rxDarkColor.removeDuplicates().replaceErrorWithEmpty().sink(receiveValue: { [weak self] color in
             self?.snowFlakeView.backgroundColor = color
-        }).disposed(by: disposeBag)
+        }).store(in: &cancellables)
 
-        viewModel.rxProgresses.subscribe(onNext: { [weak self] progresses in
+        viewModel.rxProgresses.replaceErrorWithEmpty().sink(receiveValue: { [weak self] progresses in
             if let progress = progresses.first {
                 self?.contextColorView.hasValidProgress = true
                 self?.contextColorView.progress = progress.relativePosition
@@ -97,25 +84,14 @@ final class SessionCellView: NSView {
                 self?.contextColorView.hasValidProgress = false
                 self?.contextColorView.progress = 0
             }
-        }).disposed(by: disposeBag)
-
-        viewModel.rxSessionType.distinctUntilChanged().subscribe(onNext: { [weak self] type in
-            guard ![.lab, .session, .labByAppointment].contains(type) else { return }
-
-            switch type {
-            case .getTogether:
-                self?.thumbnailImageView.image = #imageLiteral(resourceName: "get-together")
-            default:
-                self?.thumbnailImageView.image = #imageLiteral(resourceName: "special")
-            }
-        }).disposed(by: disposeBag)
+        }).store(in: &cancellables)
     }
 
     private lazy var titleLabel: NSTextField = {
         let l = NSTextField(labelWithString: "")
         l.font = .systemFont(ofSize: 14, weight: .medium)
         l.textColor = .primaryText
-        l.cell?.backgroundStyle = .dark
+        l.cell?.backgroundStyle = .emphasized
         l.lineBreakMode = .byTruncatingTail
 
         return l
@@ -125,7 +101,7 @@ final class SessionCellView: NSView {
         let l = NSTextField(labelWithString: "")
         l.font = .systemFont(ofSize: 12)
         l.textColor = .secondaryText
-        l.cell?.backgroundStyle = .dark
+        l.cell?.backgroundStyle = .emphasized
         l.lineBreakMode = .byTruncatingTail
 
         return l
@@ -135,7 +111,7 @@ final class SessionCellView: NSView {
         let l = NSTextField(labelWithString: "")
         l.font = .systemFont(ofSize: 12)
         l.textColor = .tertiaryText
-        l.cell?.backgroundStyle = .dark
+        l.cell?.backgroundStyle = .emphasized
         l.lineBreakMode = .byTruncatingTail
 
         return l

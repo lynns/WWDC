@@ -7,7 +7,7 @@
 //
 
 import Foundation
-import os.log
+import OSLog
 
 public extension Notification.Name {
     static let WWDCEnvironmentDidChange = Notification.Name("WWDCEnvironmentDidChange")
@@ -16,7 +16,6 @@ public extension Notification.Name {
 public struct Environment: Equatable {
 
     public let baseURL: String
-    public let cocoaHubBaseURL: String
     public let configPath: String
     public let sessionsPath: String
     public let newsPath: String
@@ -24,14 +23,12 @@ public struct Environment: Equatable {
     public let featuredSectionsPath: String
 
     public init(baseURL: String,
-                cocoaHubBaseURL: String,
                 configPath: String,
                 sessionsPath: String,
                 newsPath: String,
                 liveVideosPath: String,
                 featuredSectionsPath: String) {
         self.baseURL = baseURL
-        self.cocoaHubBaseURL = cocoaHubBaseURL
         self.configPath = configPath
         self.sessionsPath = sessionsPath
         self.newsPath = newsPath
@@ -51,7 +48,7 @@ public struct Environment: Equatable {
 
         if shouldNotify {
             DispatchQueue.main.async {
-                os_log("Environment base URL: %@", log: .default, type: .info, environment.baseURL)
+                log.info("Environment base URL: \(environment.baseURL)")
 
                 NotificationCenter.default.post(name: .WWDCEnvironmentDidChange, object: environment)
             }
@@ -66,19 +63,16 @@ private var _storedEnvironment: Environment? = Environment.readFromDefaults()
 
 extension Environment {
 
-    public static let defaultCocoaHubBaseURL = "https://cocoahub.wwdc.io"
-
     static func readFromDefaults() -> Environment? {
         guard let baseURL = UserDefaults.standard.object(forKey: _storedEnvDefaultsKey) as? String else { return nil }
 
         return Environment(
             baseURL: baseURL,
-            cocoaHubBaseURL: Self.defaultCocoaHubBaseURL,
             configPath: "/config.json",
             sessionsPath: "/sessions.json",
             newsPath: "/news.json",
             liveVideosPath: "/videos_live.json",
-            featuredSectionsPath: "/_featured.json"
+            featuredSectionsPath: "/explore.json"
         )
     }
 
@@ -86,12 +80,11 @@ extension Environment {
         #if DEBUG
         if let baseURL = UserDefaults.standard.string(forKey: "WWDCEnvironmentBaseURL") {
             return Environment(baseURL: baseURL,
-                               cocoaHubBaseURL: Self.defaultCocoaHubBaseURL,
                                configPath: "/config.json",
                                sessionsPath: "/contents.json",
                                newsPath: "/news.json",
                                liveVideosPath: "/videos_live.json",
-                               featuredSectionsPath: "/_featured.json")
+                               featuredSectionsPath: "/explore.json")
         }
         #endif
         if ProcessInfo.processInfo.arguments.contains("--test") {
@@ -106,19 +99,21 @@ extension Environment {
     }
 
     public static let test = Environment(baseURL: "http://localhost:9042",
-                                         cocoaHubBaseURL: Self.defaultCocoaHubBaseURL,
                                          configPath: "/config.json",
                                          sessionsPath: "/contents.json",
                                          newsPath: "/news.json",
                                          liveVideosPath: "/videos_live.json",
-                                         featuredSectionsPath: "/_featured.json")
+                                         featuredSectionsPath: "/explore.json")
 
     public static let production = Environment(baseURL: "https://api2021.wwdc.io",
-                                               cocoaHubBaseURL: Self.defaultCocoaHubBaseURL,
                                                configPath: "/config.json",
                                                sessionsPath: "/contents.json",
                                                newsPath: "/news.json",
                                                liveVideosPath: "/videos_live.json",
-                                               featuredSectionsPath: "/_featured.json")
+                                               featuredSectionsPath: "/explore.json")
 
+}
+
+extension Environment: Logging {
+    public static let log = makeLogger()
 }

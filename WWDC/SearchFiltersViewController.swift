@@ -7,11 +7,22 @@
 //
 
 import Cocoa
+import ConfCore
+
+enum FilterChangeReason: Equatable {
+    case initialValue
+    case configurationChange
+    case userInput
+    case allowSelection
+}
 
 protocol SearchFiltersViewControllerDelegate: AnyObject {
 
-    func searchFiltersViewController(_ controller: SearchFiltersViewController, didChangeFilters filters: [FilterType])
-
+    func searchFiltersViewController(
+        _ controller: SearchFiltersViewController,
+        didChangeFilters filters: [FilterType],
+        context: FilterChangeReason
+    )
 }
 
 enum FilterSegment: Int {
@@ -55,6 +66,7 @@ final class SearchFiltersViewController: NSViewController {
         return storyboard.instantiateController(withIdentifier: "SearchFiltersViewController") as! SearchFiltersViewController
     }
 
+    @IBOutlet weak var stackView: NSStackView!
     @IBOutlet weak var eventsPopUp: NSPopUpButton!
     @IBOutlet weak var focusesPopUp: NSPopUpButton!
     @IBOutlet weak var tracksPopUp: NSPopUpButton!
@@ -77,14 +89,31 @@ final class SearchFiltersViewController: NSViewController {
 
     private var effectiveFilters: [FilterType] = []
 
-    func resetFilters() {
+    var additionalPredicates: [NSPredicate] = []
+    var currentPredicate: NSPredicate? {
+        let filters = filters
+        guard filters.contains(where: { !$0.isEmpty }) || !additionalPredicates.isEmpty else {
+            return nil
+        }
 
-        filters = filters.map {
+        let subpredicates = filters.compactMap { $0.predicate } + additionalPredicates
+
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: subpredicates)
+
+        return predicate
+    }
+
+    func clearAllFilters(reason: FilterChangeReason) {
+        let updatedFilters = filters.map {
             var resetFilter = $0
             resetFilter.reset()
 
             return resetFilter
         }
+
+        filters = updatedFilters
+
+        delegate?.searchFiltersViewController(self, didChangeFilters: updatedFilters, context: reason)
     }
 
     weak var delegate: SearchFiltersViewControllerDelegate?
@@ -156,6 +185,9 @@ final class SearchFiltersViewController: NSViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
 
+        /// Move background and content from behind the title bar.
+        vfxView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor).isActive = true
+
         setFilters(hidden: true)
 
         updateUI()
@@ -174,20 +206,25 @@ final class SearchFiltersViewController: NSViewController {
         guard let menu = popUp.menu else { return }
         guard var filter = effectiveFilters[filterIndex] as? MultipleChoiceFilter else { return }
 
-        selectedItem.state = (selectedItem.state == .off) ? .on : .off
+        if let option = selectedItem.representedObject as? FilterOption, option.isClear {
+            filter.selectedOptions = []
+            menu.items.forEach { $0.state = .off }
+        } else {
+            selectedItem.state = (selectedItem.state == .off) ? .on : .off
 
-        let selected = menu.items.filter({ $0.state == .on }).compactMap({ $0.representedObject as? FilterOption })
+            let selected = menu.items.filter({ $0.state == .on }).compactMap({ $0.representedObject as? FilterOption })
 
-        filter.selectedOptions = selected
+            filter.selectedOptions = selected
+        }
 
         var updatedFilters = effectiveFilters
         updatedFilters[filterIndex] = filter
 
-        delegate?.searchFiltersViewController(self, didChangeFilters: updatedFilters)
-
         popUp.title = filter.title
 
         effectiveFilters = updatedFilters
+
+        delegate?.searchFiltersViewController(self, didChangeFilters: updatedFilters, context: .userInput)
     }
 
     private func updateToggleFilter(at filterIndex: Int, with state: Bool) {
@@ -198,9 +235,9 @@ final class SearchFiltersViewController: NSViewController {
         var updatedFilters = effectiveFilters
         updatedFilters[filterIndex] = filter
 
-        delegate?.searchFiltersViewController(self, didChangeFilters: updatedFilters)
-
         effectiveFilters = updatedFilters
+
+        delegate?.searchFiltersViewController(self, didChangeFilters: updatedFilters, context: .userInput)
     }
 
     private func updateTextualFilter(at filterIndex: Int, with text: String) {
@@ -212,9 +249,9 @@ final class SearchFiltersViewController: NSViewController {
         var updatedFilters = effectiveFilters
         updatedFilters[filterIndex] = filter
 
-        delegate?.searchFiltersViewController(self, didChangeFilters: updatedFilters)
-
         effectiveFilters = updatedFilters
+
+        delegate?.searchFiltersViewController(self, didChangeFilters: updatedFilters, context: .userInput)
 
         NSPasteboard(name: .find).clearContents()
         NSPasteboard(name: .find).setString(text, forType: .string)
@@ -253,18 +290,7 @@ final class SearchFiltersViewController: NSViewController {
             switch filter {
 
             case let filter as MultipleChoiceFilter:
-                guard let popUp = popUpButton(for: filter) else { return }
-
-                popUp.removeAllItems()
-
-                popUp.addItem(withTitle: filter.title)
-
-                filter.options.forEach { option in
-                    let item = NSMenuItem(title: option.title, action: nil, keyEquivalent: "")
-                    item.representedObject = option
-                    item.state = filter.selectedOptions.contains(option) ? .on : .off
-                    popUp.menu?.addItem(item)
-                }
+                updatePopUp(for: filter)
             case let filter as TextualFilter:
                 searchField.stringValue = filter.value ?? ""
             case let filter as ToggleFilter:
@@ -283,5 +309,25 @@ final class SearchFiltersViewController: NSViewController {
         downloadedSegmentSelected = bottomSegmentedControl.isSelected(for: .downloaded)
         unwatchedSegmentSelected = bottomSegmentedControl.isSelected(for: .unwatched)
         bookmarksSegmentSelected = bottomSegmentedControl.isSelected(for: .bookmarks)
+    }
+
+    private func updatePopUp(for filter: MultipleChoiceFilter) {
+        guard let popUp = popUpButton(for: filter) else { return }
+
+        popUp.removeAllItems()
+
+        popUp.addItem(withTitle: filter.title)
+
+        filter.options.forEach { option in
+            guard !option.isSeparator else {
+                popUp.menu?.addItem(.separator())
+                return
+            }
+
+            let item = NSMenuItem(title: option.title, action: nil, keyEquivalent: "")
+            item.representedObject = option
+            item.state = filter.selectedOptions.contains(option) ? .on : .off
+            popUp.menu?.addItem(item)
+        }
     }
 }

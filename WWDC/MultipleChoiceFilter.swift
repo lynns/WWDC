@@ -9,6 +9,9 @@
 import Foundation
 
 struct FilterOption: Equatable, Codable {
+    private static let separatorTitle = "-------"
+    private static let clearTitle = "Clear"
+
     let title: String
     let value: String
     var isNegative: Bool = false
@@ -26,6 +29,12 @@ struct FilterOption: Equatable, Codable {
     enum CodingKeys: String, CodingKey {
         case value, title
     }
+
+    static var separator: FilterOption { .init(title: Self.separatorTitle, value: Self.separatorTitle) }
+    static var clear: FilterOption { .init(title: Self.clearTitle, value: Self.clearTitle) }
+
+    var isSeparator: Bool { title == Self.separatorTitle }
+    var isClear: Bool { title == Self.clearTitle }
 }
 
 extension Array where Element == FilterOption {
@@ -48,13 +57,26 @@ extension Array where Element == FilterOption {
 }
 
 struct MultipleChoiceFilter: FilterType {
+    private static func optionsWithClear(_ newValue: [FilterOption]) -> [FilterOption] {
+        if !newValue.contains(.clear) {
+            var withClear = newValue
+            withClear.append(.separator)
+            withClear.append(.clear)
+            return withClear
+        } else {
+            return newValue
+        }
+    }
 
     var identifier: FilterIdentifier
-    var isSubquery: Bool
-    var collectionKey: String
+    var collectionKey: String?
     var modelKey: String
-    var options: [FilterOption]
-    private var _selectedOptions: [FilterOption] = [FilterOption]()
+    private var _options: [FilterOption]
+    var options: [FilterOption] {
+        get { _options }
+        set { _options = Self.optionsWithClear(newValue) }
+    }
+    private var _selectedOptions: [FilterOption] = []
     var selectedOptions: [FilterOption] {
         get {
             return _selectedOptions
@@ -91,8 +113,8 @@ struct MultipleChoiceFilter: FilterType {
 
             let op = option.isNegative ? "!=" : "=="
 
-            if isSubquery {
-                format = "SUBQUERY(\(collectionKey), $\(collectionKey), $\(collectionKey).\(modelKey) \(op) %@).@count > 0"
+            if let collectionKey {
+                format = "SUBQUERY(\(collectionKey), $iter, $iter.\(modelKey) \(op) %@).@count > 0"
             } else {
                 format = "\(modelKey) \(op) %@"
             }
@@ -103,16 +125,12 @@ struct MultipleChoiceFilter: FilterType {
         return NSCompoundPredicate(orPredicateWithSubpredicates: subpredicates)
     }
 
-    init(identifier: FilterIdentifier, isSubquery: Bool, collectionKey: String, modelKey: String, options: [FilterOption], selectedOptions: [FilterOption], emptyTitle: String) {
+    init(id identifier: FilterIdentifier, modelKey: String, collectionKey: String? = nil, options: [FilterOption], emptyTitle: String) {
         self.identifier = identifier
-        self.isSubquery = isSubquery
         self.collectionKey = collectionKey
         self.modelKey = modelKey
-        self.options = options
+        self._options = Self.optionsWithClear(options)
         self.emptyTitle = emptyTitle
-
-        // Computed property
-        self.selectedOptions = selectedOptions
     }
 
     mutating func reset() {

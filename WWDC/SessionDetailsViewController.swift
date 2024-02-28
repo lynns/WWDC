@@ -7,20 +7,14 @@
 //
 
 import Cocoa
-import RxSwift
-import RxCocoa
 
-class SessionDetailsViewController: NSViewController {
+final class SessionDetailsViewController: WWDCWindowContentViewController {
 
     private struct Metrics {
         static let padding: CGFloat = 46
     }
 
-    private let disposeBag = DisposeBag()
-
-    let listStyle: SessionsListStyle
-
-    var viewModel: SessionViewModel? = nil {
+    var viewModel: SessionViewModel? {
         didSet {
             view.animator().alphaValue = (viewModel == nil) ? 0 : 1
 
@@ -40,23 +34,6 @@ class SessionDetailsViewController: NSViewController {
 
             let shouldHideButtonsBar = transcriptButton.isHidden && bookmarksButton.isHidden
             menuButtonsContainer.isHidden = shouldHideButtonsBar
-
-            let instance = viewModel.sessionInstance
-            let type = instance.type
-
-            let sessionHasNoVideo = [.lab, .getTogether, .labByAppointment].contains(type) && !(instance.isCurrentlyLive == true)
-
-            shelfController.view.isHidden = sessionHasNoVideo
-
-            // It's worth noting that this condition will always be true since the view
-            // gets loaded when add to the split view controller
-            if isViewLoaded {
-                // Connect stack view (bottom half of screen), to the top of the view
-                // or to the bottom of the video, if it's present
-                shelfBottomConstraint.isActive = !sessionHasNoVideo
-                informationStackViewTopConstraint.isActive = sessionHasNoVideo
-                informationStackViewBottomConstraint.isActive = !sessionHasNoVideo
-            }
         }
     }
 
@@ -156,9 +133,7 @@ class SessionDetailsViewController: NSViewController {
     let summaryController: SessionSummaryViewController
     let transcriptController: SessionTranscriptViewController
 
-    init(listStyle: SessionsListStyle) {
-        self.listStyle = listStyle
-
+    init() {
         shelfController = ShelfViewController()
         summaryController = SessionSummaryViewController()
         transcriptController = SessionTranscriptViewController()
@@ -200,7 +175,6 @@ class SessionDetailsViewController: NSViewController {
 
         shelfController.view.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: Metrics.padding).isActive = true
         shelfController.view.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -Metrics.padding).isActive = true
-        shelfController.view.topAnchor.constraint(equalTo: view.topAnchor, constant: 22).isActive = true
 
         informationStackView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: Metrics.padding).isActive = true
         informationStackView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -Metrics.padding).isActive = true
@@ -211,6 +185,8 @@ class SessionDetailsViewController: NSViewController {
 
         showOverview()
     }
+
+    override var childForWindowTopSafeAreaConstraint: NSViewController? { shelfController }
 
     @objc private func tabButtonAction(_ sender: WWDCTextButton) {
         if sender == overviewButton {

@@ -8,9 +8,7 @@
 
 import Cocoa
 import ConfCore
-import RxRealm
-import RxSwift
-import RxCocoa
+import Combine
 import RealmSwift
 import PlayerUI
 
@@ -20,50 +18,55 @@ final class SessionViewModel {
     var title: String
     let session: Session
     let sessionInstance: SessionInstance
+    let track: Track
     let identifier: String
-    var webUrl: URL?
+    lazy var webUrl: URL? = {
+        SessionViewModel.webUrl(for: session)
+    }()
     var imageUrl: URL?
     let trackName: String
 
-    private var disposeBag = DisposeBag()
-
-    lazy var rxSession: Observable<Session> = {
-        return Observable.from(object: session)
+    lazy var rxSession: some Publisher<Session, Error> = {
+        return session.valuePublisher()
     }()
 
-    lazy var rxTranscriptAnnotations: Observable<List<TranscriptAnnotation>> = {
+    lazy var rxTranscriptAnnotations: AnyPublisher<List<TranscriptAnnotation>, Error> = {
         guard let annotations = session.transcript()?.annotations else {
-            return Observable.just(List<TranscriptAnnotation>())
+            return Just(List<TranscriptAnnotation>()).setFailureType(to: Error.self).eraseToAnyPublisher()
         }
 
-        return Observable.collection(from: annotations)
+        return annotations.collectionPublisher.eraseToAnyPublisher()
     }()
 
-    lazy var rxSessionInstance: Observable<SessionInstance> = {
-        return Observable.from(object: sessionInstance)
+    lazy var rxSessionInstance: some Publisher<SessionInstance, Error> = {
+        return sessionInstance.valuePublisher()
     }()
 
-    lazy var rxTitle: Observable<String> = {
+    lazy var rxTrack: some Publisher<Track, Error> = {
+        return track.valuePublisher()
+    }()
+
+    lazy var rxTitle: some Publisher<String, Error> = {
         return rxSession.map { $0.title }
     }()
 
-    lazy var rxSubtitle: Observable<String> = {
+    lazy var rxSubtitle: some Publisher<String, Error> = {
         return rxSession.map { SessionViewModel.subtitle(from: $0, at: $0.event.first) }
     }()
 
-    lazy var rxTrackName: Observable<String> = {
-        return rxSession.map { $0.track.first?.name }.ignoreNil()
+    lazy var rxTrackName: some Publisher<String, Error> = {
+        return rxTrack.map { $0.name }
     }()
 
-    lazy var rxSummary: Observable<String> = {
+    lazy var rxSummary: some Publisher<String, Error> = {
         return rxSession.map { $0.summary }
     }()
 
-    lazy var rxActionPrompt: Observable<String?> = {
-        guard sessionInstance.startTime > today() else { return Observable.just(nil) }
-        guard actionLinkURL != nil else { return Observable.just(nil) }
+    lazy var rxActionPrompt: AnyPublisher<String?, Error> = {
+        guard sessionInstance.startTime > today() else { return Just(nil).setFailureType(to: Error.self).eraseToAnyPublisher() }
+        guard actionLinkURL != nil else { return Just(nil).setFailureType(to: Error.self).eraseToAnyPublisher() }
 
-        return rxSessionInstance.map { $0.actionLinkPrompt }
+        return rxSessionInstance.map { $0.actionLinkPrompt }.eraseToAnyPublisher()
     }()
 
     var actionLinkURL: URL? {
@@ -72,119 +75,117 @@ final class SessionViewModel {
         return URL(string: candidateURL)
     }
 
-    lazy var rxContext: Observable<String> = {
+    lazy var rxContext: AnyPublisher<String, Error> = {
         if self.style == .schedule {
 
-            return Observable.combineLatest(rxSession, rxSessionInstance).map {
+            return Publishers.CombineLatest(rxSession, rxSessionInstance).map {
                 SessionViewModel.context(for: $0.0, instance: $0.1)
-            }
+            }.eraseToAnyPublisher()
         } else {
-            return rxSession.map { SessionViewModel.context(for: $0) }
+            return Publishers.CombineLatest(rxSession, rxTrack).map {
+                SessionViewModel.context(for: $0.0, track: $0.1)
+            }.eraseToAnyPublisher()
         }
     }()
 
-    lazy var rxFooter: Observable<String> = {
+    lazy var rxFooter: some Publisher<String, Error> = {
         return rxSession.map { SessionViewModel.footer(for: $0, at: $0.event.first) }
     }()
 
-    lazy var rxSessionType: Observable<SessionInstanceType> = {
-        return rxSession.map { $0.instances.first?.type }.ignoreNil()
+    lazy var rxColor: some Publisher<NSColor, Error> = {
+        return rxSession.compactMap { SessionViewModel.trackColor(for: $0) }
     }()
 
-    lazy var rxColor: Observable<NSColor> = {
-        return rxSession.map { SessionViewModel.trackColor(for: $0) }.ignoreNil()
+    lazy var rxDarkColor: some Publisher<NSColor, Error> = {
+        return rxSession.compactMap { SessionViewModel.darkTrackColor(for: $0) }
     }()
 
-    lazy var rxDarkColor: Observable<NSColor> = {
-        return rxSession.map { SessionViewModel.darkTrackColor(for: $0) }.ignoreNil()
-    }()
-
-    lazy var rxImageUrl: Observable<URL?> = {
+    lazy var rxImageUrl: some Publisher<URL?, Error> = {
         return rxSession.map { SessionViewModel.imageUrl(for: $0) }
     }()
 
-    lazy var rxWebUrl: Observable<URL?> = {
+    lazy var rxWebUrl: some Publisher<URL?, Error> = {
         return rxSession.map { SessionViewModel.webUrl(for: $0) }
     }()
 
-    lazy var rxIsDownloaded: Observable<Bool> = {
+    lazy var rxIsDownloaded: some Publisher<Bool, Error> = {
         return rxSession.map { $0.isDownloaded }
     }()
 
-    lazy var rxIsFavorite: Observable<Bool> = {
-        return Observable.collection(from: self.session.favorites.filter("isDeleted == false")).map { $0.count > 0 }
+    lazy var rxIsFavorite: some Publisher<Bool, Error> = {
+        // While scrolling the favorites publisher won't be able to fire
+        // because the events are tracking. I'm guessing because it's using the main
+        // runloop? Regardless, putting the subscription on a background queue fixes it
+        return self.session.favorites.filter("isDeleted == false")
+            .changesetPublisherShallow(keyPaths: ["identifier"])
+            .subscribe(on: DispatchQueue(label: #function))
+            .threadSafeReference()
+            .receive(on: DispatchQueue.main)
+            .map { $0.count > 0 }
     }()
 
-    lazy var rxIsCurrentlyLive: Observable<Bool> = {
+    lazy var rxIsCurrentlyLive: some Publisher<Bool, Error> = {
         guard self.sessionInstance.realm != nil else {
-            return Observable.just(false)
+            return Just(false).setFailureType(to: Error.self).eraseToAnyPublisher()
         }
 
-        return rxSessionInstance.map { $0.isCurrentlyLive }
+        return rxSessionInstance.map { $0.isCurrentlyLive }.eraseToAnyPublisher()
     }()
 
-    lazy var rxIsLab: Observable<Bool> = {
-        guard self.sessionInstance.realm != nil else {
-            return Observable.just(false)
-        }
-
-        return rxSessionInstance.map { [.lab, .labByAppointment].contains($0.type) }
-    }()
-
-    lazy var rxPlayableContent: Observable<Results<SessionAsset>> = {
+    lazy var rxPlayableContent: some Publisher<Results<SessionAsset>, Error> = {
         let playableAssets = self.session.assets(matching: [.streamingVideo, .liveStreamVideo])
 
-        return Observable.collection(from: playableAssets)
+        return playableAssets.collectionPublisher
     }()
 
-    lazy var rxCanBePlayed: Observable<Bool> = {
+    lazy var rxCanBePlayed: some Publisher<Bool, Error> = {
         let validAssets = self.session.assets.filter("(rawAssetType == %@ AND remoteURL != '') OR (rawAssetType == %@ AND SUBQUERY(session.instances, $instance, $instance.isCurrentlyLive == true).@count > 0)", SessionAssetType.streamingVideo.rawValue, SessionAssetType.liveStreamVideo.rawValue)
-        let validAssetsObservable = Observable.collection(from: validAssets)
+        let validAssetsObservable = validAssets.collectionPublisher
 
         return validAssetsObservable.map { $0.count > 0 }
     }()
 
-    lazy var rxDownloadableContent: Observable<Results<SessionAsset>> = {
+    lazy var rxDownloadableContent: some Publisher<Results<SessionAsset>, Error> = {
         let downloadableAssets = self.session.assets.filter("(rawAssetType == %@ AND remoteURL != '')", DownloadManager.downloadQuality.rawValue)
 
-        return Observable.collection(from: downloadableAssets)
+        return downloadableAssets.collectionPublisher
     }()
 
-    lazy var rxProgresses: Observable<Results<SessionProgress>> = {
+    lazy var rxProgresses: some Publisher<Results<SessionProgress>, Error> = {
         let progresses = self.session.progresses.filter(NSPredicate(value: true))
 
-        return Observable.collection(from: progresses)
+        return progresses.collectionPublisher
     }()
 
-    lazy var rxRelatedSessions: Observable<Results<RelatedResource>> = {
+    lazy var rxRelatedSessions: some Publisher<Results<RelatedResource>, Error> = {
         // Return sessions with videos, or any session that hasn't yet occurred
         let predicateFormat = "type == %@ AND (ANY session.assets.rawAssetType == %@ OR ANY session.instances.startTime >= %@)"
         let relatedPredicate = NSPredicate(format: predicateFormat, RelatedResourceType.session.rawValue, SessionAssetType.streamingVideo.rawValue, today() as NSDate)
         let validRelatedSessions = self.session.related.filter(relatedPredicate)
 
-        return Observable.collection(from: validRelatedSessions)
+        return validRelatedSessions.collectionPublisher
     }()
 
     convenience init?(session: Session) {
-        self.init(session: session, instance: nil, style: .videos)
+        self.init(session: session, instance: nil, track: nil, style: .videos)
     }
 
-    init?(session: Session?, instance: SessionInstance?, style: SessionsListStyle) {
+    convenience init?(session: Session, track: Track) {
+        self.init(session: session, instance: nil, track: track, style: .videos)
+    }
+
+    init?(session: Session?, instance: SessionInstance?, track: Track?, style: SessionsListStyle) {
         self.style = style
 
         guard let session = session ?? instance?.session else { return nil }
-        guard let track = session.track.first ?? instance?.track.first else { return nil }
+        guard let track = track ?? session.track.first ?? instance?.track.first else { return nil }
+        self.session = session
+        self.track = track
 
         trackName = track.name
-        self.session = session
         sessionInstance = instance ?? session.instances.first ?? SessionInstance()
         title = session.title
         identifier = session.identifier
-        imageUrl = SessionViewModel.imageUrl(for: session)
-
-        if let webUrlStr = session.asset(ofType: .webpage)?.remoteURL {
-            webUrl = URL(string: webUrlStr)
-        }
     }
 
     static func subtitle(from session: Session, at event: ConfCore.Event?) -> String {
@@ -219,26 +220,33 @@ final class SessionViewModel {
         return result
     }
 
-    static func context(for session: Session, instance: SessionInstance? = nil) -> String {
-        if let instance = instance {
-            var result = timeFormatter.string(from: instance.startTime) + " - " + timeFormatter.string(from: instance.endTime)
+    static func context(for session: Session, instance: SessionInstance? = nil, track: Track? = nil) -> String {
+        var components = [String]()
 
-            result += " · " + instance.roomName
+        if let instance {
+            components = [timeFormatter.string(from: instance.startTime)]
 
-            return result
+            /// The end time is only relevant when the instance has a live component,
+            /// and let's also ensure the start and end times are not the same just in case.
+            if instance.hasLiveStream, instance.startTime != instance.endTime {
+                components.append(timeFormatter.string(from: instance.endTime))
+            }
+        } else {
+            components = []
+        }
+
+        /// Display either track or focuses, prioritizing track, since both won't fit.
+        if let trackName = (track ?? session.track.first)?.name {
+            components.append(trackName)
         } else {
             let focusesArray = session.focuses.toArray()
-
-            let focuses = SessionViewModel.focusesDescription(from: focusesArray, collapse: true)
-
-            var result = session.track.first?.name ?? ""
-
-            if focusesArray.count > 0 {
-                result = "\(focuses) · " + result
+            if !focusesArray.isEmpty {
+                let focuses = SessionViewModel.focusesDescription(from: focusesArray, collapse: true)
+                components.append(focuses)
             }
-
-            return result
         }
+
+        return components.joined(separator: " · ")
     }
 
     static func footer(for session: Session, at event: ConfCore.Event?) -> String {
@@ -266,12 +274,6 @@ final class SessionViewModel {
     }
 
     static func imageUrl(for session: Session) -> URL? {
-        if let instance = session.instances.first {
-            guard [.session, .lab, .labByAppointment].contains(instance.type) else {
-                return nil
-            }
-        }
-
         let imageAsset = session.asset(ofType: .image)
 
         guard let thumbnail = imageAsset?.remoteURL, let thumbnailUrl = URL(string: thumbnail) else { return nil }

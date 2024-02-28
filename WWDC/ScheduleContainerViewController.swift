@@ -7,15 +7,14 @@
 //
 
 import Cocoa
-import RxSwift
-import RxCocoa
+import Combine
 
-final class ScheduleContainerViewController: NSViewController {
+final class ScheduleContainerViewController: WWDCWindowContentViewController {
 
     let splitViewController: SessionsSplitViewController
 
-    init(windowController: MainWindowController, listStyle: SessionsListStyle) {
-        self.splitViewController = SessionsSplitViewController(windowController: windowController, listStyle: listStyle)
+    init(splitViewController: SessionsSplitViewController) {
+        self.splitViewController = splitViewController
 
         super.init(nibName: nil, bundle: nil)
     }
@@ -25,7 +24,8 @@ final class ScheduleContainerViewController: NSViewController {
     }
 
     /// This should be bound to a state that returns `true` when the schedule is not available.
-    private(set) var showHeroView = BehaviorRelay<Bool>(value: false)
+    @Published
+    var isShowingHeroView = false
 
     private(set) lazy var heroController: EventHeroViewController = {
         EventHeroViewController()
@@ -60,7 +60,7 @@ final class ScheduleContainerViewController: NSViewController {
         ])
     }
 
-    private let disposeBag = DisposeBag()
+    private lazy var cancellables: Set<AnyCancellable> = []
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -69,14 +69,21 @@ final class ScheduleContainerViewController: NSViewController {
     }
 
     private func bindViews() {
-        showHeroView.asDriver()
-                           .drive(splitViewController.view.rx.isHidden)
-                           .disposed(by: disposeBag)
+        $isShowingHeroView.replaceError(with: false).driveUI(\.view.isHidden, on: splitViewController)
+                           .store(in: &cancellables)
 
-        showHeroView.asDriver()
-                           .map({ !$0 })
-                           .drive(heroController.view.rx.isHidden)
-                           .disposed(by: disposeBag)
+        $isShowingHeroView.toggled().replaceError(with: true)
+                           .driveUI(\.view.isHidden, on: heroController)
+                           .store(in: &cancellables)
+
+        $isShowingHeroView.driveUI { [weak self] _ in
+            self?.view.needsUpdateConstraints = true
+        }
+        .store(in: &cancellables)
     }
-    
+
+    override var childForWindowTopSafeAreaConstraint: NSViewController? {
+        isShowingHeroView ? heroController : nil
+    }
+
 }

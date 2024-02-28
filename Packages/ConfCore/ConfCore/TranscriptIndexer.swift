@@ -9,18 +9,17 @@
 import Cocoa
 import RealmSwift
 import Transcripts
-import os.log
+import OSLog
 
 extension Notification.Name {
     public static let TranscriptIndexingDidStart = Notification.Name("io.wwdc.app.TranscriptIndexingDidStartNotification")
     public static let TranscriptIndexingDidStop = Notification.Name("io.wwdc.app.TranscriptIndexingDidStopNotification")
 }
 
-public final class TranscriptIndexer {
+public final class TranscriptIndexer: Logging {
 
     private let storage: Storage
-    private static let log = OSLog(subsystem: "ConfCore", category: "TranscriptIndexer")
-    private let log = TranscriptIndexer.log
+    public static let log = makeLogger()
     public var manifestURL: URL
     public var ignoreExistingEtags = false
 
@@ -62,19 +61,24 @@ public final class TranscriptIndexer {
 
     public static let minTranscriptableSessionLimit: Int = 30
 
-    public static let transcriptableSessionsPredicate: NSPredicate = NSPredicate(format: "ANY event.year > 2012 AND ANY event.year <= 2020 AND transcriptIdentifier == '' AND SUBQUERY(assets, $asset, $asset.rawAssetType == %@).@count > 0", SessionAssetType.streamingVideo.rawValue)
+    public static let transcriptableSessionsPredicate: NSPredicate = NSPredicate(format: "transcriptIdentifier == '' AND SUBQUERY(assets, $asset, $asset.rawAssetType == %@).@count > 0", SessionAssetType.streamingVideo.rawValue)
 
     public static func needsUpdate(in storage: Storage) -> Bool {
         // Manifest-based updates.
         guard !shouldFetchRemoteManifest else {
-            os_log("Transcripts will be checked against remote manifest", log: self.log, type: .debug)
+            log.debug("Transcripts will be checked against remote manifest")
             return true
         }
 
         // Local cache-based updates.
-        let transcriptedSessions = storage.realm.objects(Session.self).filter(TranscriptIndexer.transcriptableSessionsPredicate)
+        let transcriptableSessions = storage.realm.objects(Session.self).filter(TranscriptIndexer.transcriptableSessionsPredicate)
 
-        return transcriptedSessions.count > minTranscriptableSessionLimit
+        let shouldIndex = transcriptableSessions.count > minTranscriptableSessionLimit
+        if !shouldIndex {
+            log.debug("needsUpdate is false because \(transcriptableSessions.count) <= \(minTranscriptableSessionLimit)")
+        }
+
+        return shouldIndex
     }
 
     private func makeDownloader() -> TranscriptDownloader {
@@ -90,6 +94,7 @@ public final class TranscriptIndexer {
     var didStop: () -> Void = { }
 
     public func downloadTranscriptsIfNeeded() {
+        log.debug(#function)
         downloader = makeDownloader()
 
         didStart()
@@ -106,33 +111,30 @@ public final class TranscriptIndexer {
 
             let knownSessionIds = Array(realm.objects(Session.self).map(\.identifier))
 
-            os_log("Got %d session IDs", log: self.log, type: .debug, knownSessionIds.count)
+            log.debug("Got \(knownSessionIds.count) session IDs")
 
             downloader.fetch(validSessionIdentifiers: knownSessionIds, progress: { [weak self] progress in
                 guard let self = self else { return }
 
-                os_log("Transcript indexing progresss: %.2f", log: self.log, type: .default, progress)
+                log.debug("Transcript indexing progress: \(progress, format: .fixed(precision: 2))")
 
                 self.progressChanged(progress)
             }) { [weak self] in
                 self?.finished()
             }
         } catch {
-            os_log("Failed to initialize Realm: %{public}@", log: self.log, type: .fault, String(describing: error))
+            log.fault("Failed to initialize Realm: \(String(describing: error), privacy: .public)")
         }
     }
 
     fileprivate func store(_ transcripts: [Transcript]) {
         storage.backgroundUpdate { [weak self] backgroundRealm in
             guard let self = self else { return }
-            os_log("Start transcript realm updates", log: self.log, type: .debug)
+            log.debug("Start transcript realm updates")
 
             transcripts.forEach { transcript in
                 guard let session = backgroundRealm.object(ofType: Session.self, forPrimaryKey: transcript.identifier) else {
-                    os_log("Corresponding session not found for transcript with identifier %{public}@",
-                           log: self.log,
-                           type: .error,
-                           transcript.identifier)
+                    self.log.error("Corresponding session not found for transcript with identifier \(transcript.identifier, privacy: .public)")
 
                     return
                 }
@@ -143,7 +145,7 @@ public final class TranscriptIndexer {
                 backgroundRealm.add(transcript, update: .modified)
             }
 
-            os_log("Finished transcript realm updates", log: self.log, type: .debug)
+            log.debug("Finished transcript realm updates")
         }
     }
 

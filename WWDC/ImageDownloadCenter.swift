@@ -7,7 +7,7 @@
 //
 
 import Cocoa
-import os.log
+import ConfCore
 
 typealias ImageDownloadCompletionBlock = (_ sourceURL: URL, _ result: (original: NSImage?, thumbnail: NSImage?)) -> Void
 
@@ -15,12 +15,13 @@ private struct ImageDownload {
     static let subsystemName = "io.WWDC.app.imageDownload"
 }
 
-final class ImageDownloadCenter {
+final class ImageDownloadCenter: Logging {
 
     static let shared: ImageDownloadCenter = ImageDownloadCenter()
 
-    private let cacheProvider = ImageCacheProvider()
-    private let log = OSLog(subsystem: ImageDownload.subsystemName, category: "ImageDownloadCenter")
+    let cache = ImageCacheProvider()
+
+    static let log = makeLogger(subsystem: ImageDownload.subsystemName, category: "ImageDownloadCenter")
 
     private let dispatchQueue = DispatchQueue(label: "ImageDownloadCenter", qos: .userInitiated, attributes: .concurrent)
     private lazy var queue: OperationQueue = {
@@ -30,16 +31,19 @@ final class ImageDownloadCenter {
 
         return q
     }()
+    
+    func cachedThumbnail(from url: URL) -> NSImage? { cache.cachedImage(for: url, thumbnailOnly: true).thumbnail }
 
+    @discardableResult
     func downloadImage(from url: URL, thumbnailHeight: CGFloat, thumbnailOnly: Bool = false, completion: @escaping ImageDownloadCompletionBlock) -> Operation? {
         if thumbnailOnly {
-            if let thumbnailImage = cacheProvider.cachedImage(for: url, thumbnailOnly: true).thumbnail {
+            if let thumbnailImage = cache.cachedImage(for: url, thumbnailOnly: true).thumbnail {
                 completion(url, (nil, thumbnailImage))
                 return nil
             }
         }
 
-        let cachedResult = cacheProvider.cachedImage(for: url)
+        let cachedResult = cache.cachedImage(for: url)
 
         guard cachedResult.original == nil && cachedResult.thumbnail == nil else {
             completion(url, cachedResult)
@@ -47,17 +51,14 @@ final class ImageDownloadCenter {
         }
 
         if let pendingOperation = activeOperation(for: url) {
-            os_log("A valid download operation already exists for the URL %@",
-                   log: self.log,
-                   type: .debug,
-                   url.absoluteString)
+            log.debug("A valid download operation already exists for the URL \(url.absoluteString)")
 
             pendingOperation.addCompletionHandler(with: completion)
 
             return nil
         }
 
-        let operation = ImageDownloadOperation(url: url, cache: cacheProvider, thumbnailHeight: thumbnailHeight)
+        let operation = ImageDownloadOperation(url: url, cache: cache, thumbnailHeight: thumbnailHeight)
         operation.addCompletionHandler(with: completion)
 
         queue.addOperation(operation)
@@ -80,7 +81,7 @@ final class ImageDownloadCenter {
         guard !deletedLegacyImageCache else { return }
         deletedLegacyImageCache = true
 
-        os_log("%{public}@", log: log, type: .debug, #function)
+        log.debug("\(#function, privacy: .public)")
 
         let baseURL = URL(fileURLWithPath: PathUtil.appSupportPathAssumingExisting)
         let realmURL = baseURL.appendingPathComponent("ImageCache.realm")
@@ -92,13 +93,13 @@ final class ImageDownloadCenter {
             try FileManager.default.removeItem(at: lockURL)
             try FileManager.default.removeItem(at: managementURL)
         } catch {
-            os_log("Failed to delete legacy image cache: %{public}@", log: self.log, type: .error, String(describing: error))
+            log.error("Failed to delete legacy image cache: \(String(describing: error), privacy: .public)")
         }
     }
 
 }
 
-private final class ImageCacheProvider {
+final class ImageCacheProvider {
 
     private lazy var inMemoryCache: NSCache<NSString, NSImage> = {
         let c = NSCache<NSString, NSImage>()
@@ -108,7 +109,7 @@ private final class ImageCacheProvider {
         return c
     }()
 
-    private let log = OSLog(subsystem: ImageDownload.subsystemName, category: "ImageCacheProvider")
+    private let log = makeLogger(subsystem: ImageDownload.subsystemName, category: "ImageCacheProvider")
 
     private let storageQueue = DispatchQueue(label: "ImageStorage", qos: .userInitiated, attributes: .concurrent)
 
@@ -121,7 +122,7 @@ private final class ImageCacheProvider {
             do {
                 try fileManager.createDirectory(at: url, withIntermediateDirectories: true, attributes: nil)
             } catch {
-                os_log("Failed to create image cache directory: %{public}@", log: self.log, type: .error, String(describing: error))
+                log.error("Failed to create image cache directory: \(String(describing: error), privacy: .public)")
             }
         }
 
@@ -131,7 +132,7 @@ private final class ImageCacheProvider {
     private func cacheFileURL(for sourceURL: URL) -> URL { self.cacheURL.appendingPathComponent(sourceURL.imageCacheKey) }
     private func thumbnailCacheFileURL(for sourceURL: URL) -> URL { self.cacheURL.appendingPathComponent(sourceURL.thumbCacheKey) }
 
-    func cacheImage(for sourceURL: URL, original: URL?, thumbnailHeight: CGFloat, completion: @escaping ((original: NSImage, thumbnail: NSImage)?) -> Void) {
+    func cacheImage(for sourceURL: URL, original: URL?, thumbnailHeight: CGFloat? = nil, completion: @escaping ((original: NSImage, thumbnail: NSImage)?) -> Void) {
         guard let original = original else {
             completion(nil)
             return
@@ -148,30 +149,38 @@ private final class ImageCacheProvider {
                 try self.fileManager.copyItem(at: original, to: url)
 
                 guard let image = NSImage(contentsOf: url) else {
-                    os_log("Failed to initalize image with %@", log: self.log, type: .error, url.path)
+                    self.log.error("Failed to initalize image with \(url.path)")
                     completion(nil)
                     return
                 }
 
-                let thumbImage = image.resized(to: thumbnailHeight)
-                guard let thumbData = thumbImage.pngRepresentation else {
-                    os_log("Failed to create thumbnail", log: self.log, type: .fault)
-                    completion(nil)
-                    return
+                let thumbImage: NSImage
+
+                if let thumbnailHeight {
+                    let thumb = image.resized(to: thumbnailHeight)
+                    guard let thumbData = thumb.pngRepresentation else {
+                        self.log.fault("Failed to create thumbnail")
+                        completion(nil)
+                        return
+                    }
+
+                    let thumbURL = self.thumbnailCacheFileURL(for: sourceURL)
+                    try thumbData.write(to: thumbURL)
+
+                    image.cacheMode = .never
+                    thumb.cacheMode = .never
+
+                    self.inMemoryCache.setObject(thumb, forKey: url.thumbCacheKey as NSString)
+                    thumbImage = thumb
+                } else {
+                    thumbImage = image
                 }
 
-                let thumbURL = self.thumbnailCacheFileURL(for: sourceURL)
-                try thumbData.write(to: thumbURL)
-
-                image.cacheMode = .never
-                thumbImage.cacheMode = .never
-
-                self.inMemoryCache.setObject(thumbImage, forKey: url.thumbCacheKey as NSString)
                 self.inMemoryCache.setObject(image, forKey: url.imageCacheKey as NSString)
 
                 completion((image, thumbImage))
             } catch {
-                os_log("Image storage failed: %{public}@", log: self.log, type: .error, String(describing: error))
+                self.log.error("Image storage failed: \(String(describing: error), privacy: .public)")
 
                 completion(nil)
             }

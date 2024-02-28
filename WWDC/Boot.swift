@@ -6,12 +6,12 @@
 //  Copyright © 2020 Guilherme Rambo. All rights reserved.
 //
 
-import Foundation
+import Cocoa
 import ConfCore
 import RealmSwift
-import os.log
+import OSLog
 
-final class Boot {
+final class Boot: Logging {
 
     struct BootstrapError: LocalizedError {
         var localizedDescription: String
@@ -20,7 +20,10 @@ final class Boot {
         enum Code: Int {
             case unknown
             case unusableStorage
+            case dataReset
         }
+
+        static let dataReset = BootstrapError(localizedDescription: "", code: .dataReset)
 
         static func unusableStorage(at url: URL) -> Self {
             BootstrapError(
@@ -35,13 +38,21 @@ final class Boot {
         }
     }
 
-    private let log = OSLog(subsystem: "WWDC", category: String(describing: Boot.self))
+    static let log = makeLogger()
 
     private static var isCompactOnLaunchEnabled: Bool {
         !UserDefaults.standard.bool(forKey: "WWDCDisableDatabaseCompression")
     }
 
     func bootstrapDependencies(readOnly: Bool = false, then completion: @escaping (Result<(storage: Storage, syncEngine: SyncEngine), BootstrapError>) -> Void) {
+        guard !confirmDataResetIfNeeded() else {
+            resetLocalStorage()
+            completion(.failure(.dataReset))
+            return
+        }
+
+        WWDCAgentRemover.removeWWDCAgentIfNeeded()
+
         do {
             let supportPath = try PathUtil.appSupportPathCreatingIfNeeded()
             let filePath = supportPath + "/ConfCore.realm"
@@ -60,16 +71,17 @@ final class Boot {
             if !readOnly {
                 realmConfig.shouldCompactOnLaunch = { [unowned self] totalBytes, usedBytes in
                     guard Self.isCompactOnLaunchEnabled else {
-                        os_log("Database compression disabled by flag", log: self.log, type: .default)
+                        self.log.log("Database compression disabled by flag")
                         return false
                     }
                     
                     let oneHundredMB = 100 * 1024 * 1024
                     
                     if (totalBytes > oneHundredMB) && (Double(usedBytes) / Double(totalBytes)) < 0.8 {
-                        os_log("Database will be compacted. Total bytes: %d, used bytes: %d", log: self.log, type: .default, totalBytes, usedBytes)
+                        self.log.log("Database will be compacted. Total bytes: \(totalBytes), used bytes: \(usedBytes)")
                         return true
                     } else {
+                        self.log.log("Database will not be compacted. Total bytes: \(totalBytes), used bytes: \(usedBytes)")
                         return false
                     }
                 }
@@ -78,7 +90,6 @@ final class Boot {
             realmConfig.migrationBlock = Storage.migrate(migration:oldVersion:)
 
             let client = AppleAPIClient(environment: .current)
-            let cocoaHubClient = CocoaHubAPIClient(environment: .current)
 
             Realm.asyncOpen(configuration: realmConfig) { result in
                 switch result {
@@ -88,7 +99,6 @@ final class Boot {
                     let syncEngine = SyncEngine(
                         storage: storage,
                         client: client,
-                        cocoaHubClient: cocoaHubClient,
                         transcriptLanguage: Preferences.shared.transcriptLanguageCode
                     )
 
@@ -98,7 +108,7 @@ final class Boot {
 
                     #if DEBUG
                     if UserDefaults.standard.bool(forKey: "WWDCSimulateDatabaseLoadingHang") {
-                        os_log("### WWDCSimulateDatabaseLoadingHang enabled, if the app is being slow to start, that's why! ###", log: self.log, type: .default)
+                        self.log.log("### WWDCSimulateDatabaseLoadingHang enabled, if the app is being slow to start, that's why! ###")
                         DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
                             completion(.success((storage, syncEngine)))
                         }
@@ -112,7 +122,7 @@ final class Boot {
                 }
             }
         } catch {
-            os_log("Bootstrap failed: %{public}@", log: self.log, type: .fault, String(describing: error))
+            log.fault("Bootstrap failed: \(String(describing: error), privacy: .public)")
             completion(.failure(.generic(error: error)))
         }
     }
@@ -134,9 +144,96 @@ final class Boot {
 
             return true
         } catch {
-            os_log("Storage path at %{public}@ failed test: %{public}@", log: self.log, type: .error, url.path, String(describing: error))
+            log.error("Storage path at \(url.path, privacy: .public) failed test: \(String(describing: error), privacy: .public)")
             return false
         }
     }
 
+    // MARK: - Hold Down Option for Reset
+
+    /// Returns `true` if the prompt was shown and the user confirmed the data reset.
+    private func confirmDataResetIfNeeded() -> Bool {
+        guard NSEvent.modifierFlags.contains(.option) else { return false }
+
+        let supportURL = URL(fileURLWithPath: PathUtil.appSupportPathAssumingExisting)
+
+        guard FileManager.default.fileExists(atPath: supportURL.path) else {
+            return false
+        }
+
+        let confirmation = NSAlert()
+        confirmation.messageText = "Reset App Data"
+
+        confirmation.informativeText = """
+        Reset local database and preferences?
+
+        If you're having issues with app hangs, slowdowns, or incorrect data, resetting the local database might help.
+
+        Local data including favorites and bookmarks will be permanently deleted.
+        """
+
+        if Preferences.shared.syncUserData {
+            confirmation.informativeText += "\n\nYour data will be restored from iCloud when the app restarts."
+        }
+
+        confirmation.addButton(withTitle: "Cancel")
+
+        confirmation.addButton(withTitle: "Reset")
+        // Tried this for the Reset button, but it looks ugly in Dark Mode for some reason :/
+        // hasDestructiveAction = true
+
+        let response = confirmation.runModal()
+
+        guard response == .alertSecondButtonReturn else { return false }
+
+        return true
+    }
+
+    private func resetLocalStorage() {
+        Task { @MainActor in
+            do {
+                UserDataSyncEngine.resetLocalMetadata()
+                
+                let supportURL = URL(fileURLWithPath: PathUtil.appSupportPathAssumingExisting)
+
+                try await NSWorkspace.shared.recycle([supportURL])
+
+                let relaunch = NSAlert()
+                relaunch.messageText = "Database Reset"
+                relaunch.informativeText = "Would you like to relaunch the app now?"
+                relaunch.addButton(withTitle: "Relaunch")
+                relaunch.addButton(withTitle: "Quit")
+
+                if relaunch.runModal() == .alertFirstButtonReturn {
+                    try NSApplication.shared.relaunch()
+                } else {
+                    NSApplication.shared.terminate(self)
+                }
+            } catch {
+                WWDCAlert.show(with: error)
+            }
+        }
+    }
+
+}
+
+extension NSApplication {
+    // Credit: Andy Kim (PFMoveApplication)
+    func relaunch(at path: String = Bundle.main.bundlePath) throws {
+        let pid = ProcessInfo.processInfo.processIdentifier
+
+        let xattrScript = "/usr/bin/xattr -d -r com.apple.quarantine \(path)"
+        let script = "(while /bin/kill -0 \(pid) >&/dev/null; do /bin/sleep 0.1; done; \(xattrScript); /usr/bin/open \(path)) &"
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+        proc.arguments = [
+            "-c",
+            script
+        ]
+
+        try proc.run()
+
+        exit(0)
+    }
 }

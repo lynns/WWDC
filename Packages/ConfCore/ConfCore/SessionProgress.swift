@@ -8,7 +8,7 @@
 
 import Cocoa
 import RealmSwift
-import os.log
+import OSLog
 
 /// Defines the user action of adding a session as favorite
 public final class SessionProgress: Object, HasCloudKitFields, SoftDeletable {
@@ -25,7 +25,7 @@ public final class SessionProgress: Object, HasCloudKitFields, SoftDeletable {
     /// When the progress was created
     @objc public dynamic var createdAt = Date()
 
-    /// When the progress was last update
+    /// When the progress was last updated
     @objc public dynamic var updatedAt = Date()
 
     /// The current position in the video (in seconds)
@@ -42,7 +42,8 @@ public final class SessionProgress: Object, HasCloudKitFields, SoftDeletable {
     }
 }
 
-extension Session {
+extension Session: Logging {
+    public static let log = makeLogger()
 
     private static let positionUpdateQueue = DispatchQueue(label: "PositionUpdate", qos: .background)
 
@@ -90,7 +91,7 @@ extension Session {
 
             try queueRealm.commitWrite()
         } catch {
-            os_log("Error updating session progress: %{public}@", log: .default, type: .error, String(describing: error))
+            log.error("Error updating session progress: \(String(describing: error), privacy: .public)")
         }
     }
 
@@ -110,7 +111,7 @@ extension Session {
 
             if mustCommit { try realm.commitWrite() }
         } catch {
-            os_log("Error updating session progress: %{public}@", log: .default, type: .error, String(describing: error))
+            log.error("Error updating session progress: \(String(describing: error), privacy: .public)")
         }
     }
 

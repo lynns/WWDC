@@ -7,9 +7,4 @@
 //
 
 @_exported import Foundation
-@_exported import RealmSwift
-@_exported import RxSwift
-@_exported import RxCocoa
-@_exported import RxRealm
 @_exported import Siesta
-@_exported import Transcripts

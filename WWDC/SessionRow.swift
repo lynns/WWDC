@@ -9,8 +9,44 @@
 import Foundation
 
 enum SessionRowKind {
-    case sectionHeader(String)
+    case sectionHeader(TopicHeaderRowContent)
     case session(SessionViewModel)
+
+    var isHeader: Bool {
+        switch self {
+        case .sectionHeader:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var headerContent: TopicHeaderRowContent? {
+        switch self {
+        case .sectionHeader(let content):
+            return content
+        default:
+            return nil
+        }
+    }
+
+    var isSession: Bool {
+        switch self {
+        case .session:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var sessionViewModel: SessionViewModel? {
+        switch self {
+        case .session(let viewModel):
+            return viewModel
+        default:
+            return nil
+        }
+    }
 }
 
 final class SessionRow: CustomDebugStringConvertible {
@@ -21,33 +57,31 @@ final class SessionRow: CustomDebugStringConvertible {
         kind = .session(viewModel)
     }
 
-    init(title: String) {
-        kind = .sectionHeader(title)
+    init(content: TopicHeaderRowContent) {
+        kind = .sectionHeader(content)
     }
 
     convenience init(date: Date, showTimeZone: Bool = false) {
         let title = SessionViewModel.standardFormatted(date: date, withTimeZoneName: showTimeZone)
 
-        self.init(title: title)
+        self.init(content: .init(title: title))
+    }
+
+    var isHeader: Bool { kind.isHeader }
+    var headerContent: TopicHeaderRowContent? { kind.headerContent }
+    var isSession: Bool { kind.isSession }
+    var sessionViewModel: SessionViewModel? { kind.sessionViewModel }
+    func represents(session: SessionIdentifiable) -> Bool {
+        sessionViewModel?.identifier == session.sessionIdentifier
     }
 
     var debugDescription: String {
         switch kind {
-        case .sectionHeader(let title):
-            return "Header: " + title
+        case .sectionHeader(let content):
+            return "Header: " + content.title
         case .session(let viewModel):
             return "Session: " + viewModel.identifier + " " + viewModel.title
         }
-    }
-}
-
-extension SessionRow {
-
-    func represents(session: SessionIdentifiable) -> Bool {
-        if case .session(let viewModel) = kind {
-            return viewModel.identifier.contains(session.sessionIdentifier)
-        }
-        return false
     }
 }
 
@@ -60,6 +94,7 @@ extension SessionRow: Hashable {
             hasher.combine(title)
         case let .session(viewModel):
             hasher.combine(viewModel.identifier)
+            hasher.combine(viewModel.trackName)
         }
     }
 
@@ -69,7 +104,8 @@ extension SessionRow: Hashable {
         switch (lhs.kind, rhs.kind) {
         case let (.sectionHeader(lhsTitle), .sectionHeader(rhsTitle)) where lhsTitle == rhsTitle:
             return true
-        case let (.session(lhsViewModel), .session(rhsViewModel)) where lhsViewModel.identifier == rhsViewModel.identifier:
+        case let (.session(lhsViewModel), .session(rhsViewModel))
+            where lhsViewModel.identifier == rhsViewModel.identifier && lhsViewModel.trackName == rhsViewModel.trackName:
             return true
         default:
             return false
